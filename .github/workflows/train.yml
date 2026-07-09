@@ -1,0 +1,65 @@
+name: Train forecasting model
+
+on:
+  schedule:
+    # Runs twice daily. Offset a couple hours after your Snowflake ~12h
+    # refresh cadence so fresh data is available -- adjust these to match
+    # your actual refresh times.
+    - cron: "0 6 * * *"
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+concurrency:
+  group: train-forecasting-model
+  cancel-in-progress: true
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Snowflake private key
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          echo "$SNOWFLAKE_PRIVATE_KEY" > snowflake_key.p8
+          chmod 600 snowflake_key.p8
+
+      - name: Build dataset (pull from Snowflake, build features + labels)
+        env:
+          SNOWFLAKE_ACCOUNT_LOCATOR: ${{ secrets.SNOWFLAKE_ACCOUNT_LOCATOR }}
+          SNOWFLAKE_ACCOUNT_URL: ${{ secrets.SNOWFLAKE_ACCOUNT_URL }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_KEY_FILE: ./snowflake_key.p8
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        run: python -m scripts.build_dataset
+
+      - name: Train model
+        run: python -m src.train
+
+      - name: Upload model + metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-${{ github.run_id }}
+          path: |
+            models/*.txt
+            models/*.json
+          retention-days: 90
+
+      - name: Clean up key file
+        if: always()
+        run: rm -f snowflake_key.p8
