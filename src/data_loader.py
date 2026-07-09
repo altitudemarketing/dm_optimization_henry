@@ -57,7 +57,25 @@ def pull_raw_data(config: dict) -> pd.DataFrame:
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     if not pd.api.types.is_datetime64_any_dtype(df["stat_date"]):
-        df["stat_date"] = pd.to_datetime(df["stat_date"])
+        # This shouldn't happen anymore -- src.snowflake_client should have
+        # already converted STAT_DATE based on Snowflake's reported column
+        # type. If we get here, that type match failed; check the
+        # "[snowflake_client] column types" log line above for what type
+        # Snowflake actually reported, rather than let this crash cryptically
+        # in dateutil the way it did before (raw epoch-day ints look like
+        # nonsense years to pandas' generic string parser).
+        sample = df["stat_date"].dropna().iloc[0] if df["stat_date"].notna().any() else None
+        try:
+            df["stat_date"] = pd.to_datetime(
+                pd.to_numeric(df["stat_date"], errors="raise"), unit="D", origin="unix"
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"stat_date came through as dtype {df['stat_date'].dtype} (sample value: "
+                f"{sample!r}) instead of a proper datetime -- src.snowflake_client's type "
+                f"conversion didn't match this column. Check the '[snowflake_client] column "
+                f"types' log line above for the actual type Snowflake reported."
+            ) from exc
 
     print(f"Pulled {len(df)} rows. stat_date range: {df['stat_date'].min()} to {df['stat_date'].max()}")
     print(

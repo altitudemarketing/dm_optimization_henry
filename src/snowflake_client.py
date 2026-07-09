@@ -141,6 +141,10 @@ def _payload_to_dataframe(
             rows.extend(resp.json().get("data", []))
 
     df = pd.DataFrame(rows, columns=columns)
+    print(
+        "[snowflake_client] column types: "
+        + ", ".join(f"{c['name']}={c['type']}(scale={c.get('scale')})" for c in row_type)
+    )
     return _convert_column_types(df, row_type)
 
 
@@ -159,13 +163,25 @@ def _convert_column_types(df: pd.DataFrame, row_type: List[Dict[str, Any]]) -> p
     more reliable than leaving downstream code to guess a column's format
     from its name or a sample value.
     """
+    handled_types = {
+        "date", "timestamp_ntz", "timestamp_ltz", "timestamp_tz",
+        "fixed", "real", "boolean", "text", "variant", "array", "object", "binary", "time",
+    }
+
     for col in row_type:
         name = col["name"]
-        sf_type = col["type"]
+        sf_type = (col.get("type") or "").strip().lower()
         scale = col.get("scale") or 0
 
         if name not in df.columns:
             continue
+
+        if sf_type not in handled_types:
+            print(
+                f"[snowflake_client] WARNING: column '{name}' has unrecognized "
+                f"type '{col.get('type')!r}' -- left as raw string. If this "
+                f"column needs numeric/date handling, add it to snowflake_client.py."
+            )
 
         if sf_type == "date":
             df[name] = pd.to_datetime(
@@ -188,6 +204,6 @@ def _convert_column_types(df: pd.DataFrame, row_type: List[Dict[str, Any]]) -> p
             df[name] = pd.to_numeric(df[name], errors="coerce")
         elif sf_type == "boolean":
             df[name] = df[name].map({"true": True, "false": False, True: True, False: False})
-        # else: text/variant/etc. -- leave as returned
+        # else: text/variant/array/object/binary/time/unrecognized -- leave as returned
 
     return df
