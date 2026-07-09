@@ -49,9 +49,28 @@ def pull_raw_data(config: dict) -> pd.DataFrame:
     df = run_query(sql)
     df.columns = [c.lower() for c in df.columns]
 
+    # src.snowflake_client already converts DATE/FIXED/REAL columns to proper
+    # pandas dtypes based on Snowflake's own column metadata (see
+    # _convert_column_types) -- these are just a defensive backstop in case a
+    # column ever comes through as plain text.
     numeric_cols = ["impressions", "clicks", "spend", "conversions", "conversions_value"]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["stat_date"]):
+        df["stat_date"] = pd.to_datetime(df["stat_date"])
 
-    df["stat_date"] = pd.to_datetime(df["stat_date"])
+    print(f"Pulled {len(df)} rows. stat_date range: {df['stat_date'].min()} to {df['stat_date'].max()}")
+    print(
+        "Sanity check -- spend: min={:.2f} max={:.2f} mean={:.2f} | "
+        "conversions: min={:.2f} max={:.2f} mean={:.2f}".format(
+            df["spend"].min(), df["spend"].max(), df["spend"].mean(),
+            df["conversions"].min(), df["conversions"].max(), df["conversions"].mean(),
+        )
+    )
+    print(
+        "If spend/conversions look off by a factor of 10/100/1000 from what "
+        "you'd expect, that points to a scale-conversion issue -- flag it "
+        "rather than let training run on bad data."
+    )
+
     return df

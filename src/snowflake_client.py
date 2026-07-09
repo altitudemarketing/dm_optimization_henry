@@ -127,7 +127,8 @@ def _poll_until_done(handle: str, headers: Dict[str, str], account_url: str) -> 
 def _payload_to_dataframe(
     payload: Dict[str, Any], headers: Dict[str, str], account_url: str
 ) -> pd.DataFrame:
-    columns = [c["name"] for c in payload["resultSetMetaData"]["rowType"]]
+    row_type = payload["resultSetMetaData"]["rowType"]
+    columns = [c["name"] for c in row_type]
     rows: List[List[Any]] = list(payload.get("data", []))
 
     partition_info = payload["resultSetMetaData"].get("partitionInfo", [])
@@ -139,4 +140,54 @@ def _payload_to_dataframe(
             resp.raise_for_status()
             rows.extend(resp.json().get("data", []))
 
-    return pd.DataFrame(rows, columns=columns)
+    df = pd.DataFrame(rows, columns=columns)
+    return _convert_column_types(df, row_type)
+
+
+def _convert_column_types(df: pd.DataFrame, row_type: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Snowflake's SQL API v2 returns raw/internal representations for several
+    types instead of human-readable strings, e.g.:
+      - DATE: integer number of days since 1970-01-01 (confirmed via a real
+        failure: "20611" is 2026-06-07, not a literal year)
+      - TIMESTAMP_*: (fractional) seconds since epoch
+      - FIXED (NUMBER/DECIMAL/INT): an integer that must be divided by
+        10**scale when the column has a nonzero scale, or it's off by a
+        factor of 10x/100x/etc. silently -- no crash, just wrong numbers.
+
+    Converting based on the type Snowflake actually reports (row_type) is
+    more reliable than leaving downstream code to guess a column's format
+    from its name or a sample value.
+    """
+    for col in row_type:
+        name = col["name"]
+        sf_type = col["type"]
+        scale = col.get("scale") or 0
+
+        if name not in df.columns:
+            continue
+
+        if sf_type == "date":
+            df[name] = pd.to_datetime(
+                pd.to_numeric(df[name], errors="coerce"), unit="D", origin="unix"
+            )
+        elif sf_type in ("timestamp_ntz", "timestamp_ltz"):
+            df[name] = pd.to_datetime(
+                pd.to_numeric(df[name], errors="coerce"), unit="s", origin="unix"
+            )
+        elif sf_type == "timestamp_tz":
+            # value format is "epoch_seconds timezone_offset_minutes"
+            seconds = df[name].astype(str).str.split(" ").str[0]
+            df[name] = pd.to_datetime(
+                pd.to_numeric(seconds, errors="coerce"), unit="s", origin="unix"
+            )
+        elif sf_type == "fixed":
+            numeric = pd.to_numeric(df[name], errors="coerce")
+            df[name] = numeric / (10 ** scale) if scale else numeric
+        elif sf_type == "real":
+            df[name] = pd.to_numeric(df[name], errors="coerce")
+        elif sf_type == "boolean":
+            df[name] = df[name].map({"true": True, "false": False, True: True, False: False})
+        # else: text/variant/etc. -- leave as returned
+
+    return df
