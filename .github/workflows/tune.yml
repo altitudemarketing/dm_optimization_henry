@@ -1,0 +1,68 @@
+name: Tune hyperparameters
+
+# Runs much less often than the training workflow -- Bayesian search is
+# expensive relative to a normal retrain, and hyperparameters don't need
+# re-optimizing every 12 hours. Weekly + on-demand is enough; adjust the
+# cron if you want it more/less frequent.
+on:
+  schedule:
+    - cron: "0 8 * * 1"  # Mondays at 08:00 UTC
+  workflow_dispatch:
+    inputs:
+      n_trials:
+        description: "Optuna trials per model"
+        required: false
+        default: "50"
+
+permissions:
+  contents: write
+
+jobs:
+  tune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Snowflake private key
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          echo "$SNOWFLAKE_PRIVATE_KEY" > snowflake_key.p8
+          chmod 600 snowflake_key.p8
+
+      - name: Build dataset
+        env:
+          SNOWFLAKE_ACCOUNT_LOCATOR: ${{ secrets.SNOWFLAKE_ACCOUNT_LOCATOR }}
+          SNOWFLAKE_ACCOUNT_URL: ${{ secrets.SNOWFLAKE_ACCOUNT_URL }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_KEY_FILE: ./snowflake_key.p8
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        run: python -m scripts.build_dataset
+
+      - name: Run Optuna tuning
+        run: python -m scripts.tune_hyperparameters --n-trials "${{ github.event.inputs.n_trials || '50' }}"
+
+      - name: Clean up key file
+        if: always()
+        run: rm -f snowflake_key.p8
+
+      - name: Commit tuned hyperparameters
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add config/best_params.json
+          git diff --cached --quiet && echo "No change to best_params.json" || git commit -m "Update tuned hyperparameters [skip ci]"
+          git push

@@ -26,6 +26,55 @@ ID_AND_META_COLUMNS = {
     "ad_group_id", "ad_group_name", "ad_group_status", "stat_date",
 }
 
+# Fixed (non-tuned) + sensible default values for the tunable hyperparameters.
+# scripts/tune_hyperparameters.py imports these as the base and overrides the
+# tunable keys with Optuna's suggestions, so there's one source of truth for
+# which keys are fixed (objective, metric, tree_method) vs. tunable.
+DEFAULT_LGB_PARAMS = {
+    "objective": "regression",
+    "metric": "mae",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "min_data_in_leaf": 20,
+    "verbosity": -1,
+}
+DEFAULT_XGB_PARAMS = {
+    "objective": "reg:squarederror",
+    "eval_metric": "mae",
+    "tree_method": "hist",
+    "eta": 0.05,
+    "max_depth": 6,
+}
+BEST_PARAMS_PATH = Path("config/best_params.json")
+
+
+def load_tuned_params(model_name: str, default_params: dict) -> dict:
+    """
+    Uses hyperparameters from config/best_params.json (produced by
+    scripts/tune_hyperparameters.py) if present, falling back to the
+    hardcoded defaults otherwise. Tuning is a separate, occasional step (see
+    that script's docstring) -- this file won't always exist or be current,
+    and that's expected, not an error.
+    """
+    if not BEST_PARAMS_PATH.exists():
+        print(f"No {BEST_PARAMS_PATH} found -- using default {model_name} hyperparameters.")
+        return dict(default_params)
+
+    with open(BEST_PARAMS_PATH) as f:
+        tuned = json.load(f)
+
+    model_tuned = tuned.get(model_name)
+    if not model_tuned:
+        print(f"{BEST_PARAMS_PATH} has no '{model_name}' entry -- using defaults.")
+        return dict(default_params)
+
+    merged = {**default_params, **model_tuned["params"]}
+    print(
+        f"Using tuned {model_name} hyperparameters from {BEST_PARAMS_PATH} "
+        f"(val MAE {model_tuned['val_mae']:.4f} at tuning time): {model_tuned['params']}"
+    )
+    return merged
+
 
 def _mape(y_true, y_pred) -> float:
     y_true = np.asarray(y_true, dtype=float)
@@ -50,6 +99,31 @@ def evaluate(y_true, y_pred, label: str) -> dict:
 
     print(f"[{label}] MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.4f}  MAPE={mape:.4f}")
     return {"mae": mae, "rmse": rmse, "r2": r2, "mape": mape}
+
+
+def evaluate_segmented(y_true, y_pred, label: str) -> dict:
+    """
+    Breaks metrics out for the zero-actual vs. nonzero-actual subsets
+    separately. A single pooled MAE/R2 can look strong largely by getting the
+    (often majority) zero-conversion cases right, which says little about
+    accuracy on the ad groups that actually matter for recommendations --
+    the ones with real conversion volume.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    zero_mask = y_true == 0
+    nonzero_mask = ~zero_mask
+
+    print(f"-- {label}, segmented by actual value --")
+    zero_metrics = (
+        evaluate(y_true[zero_mask], y_pred[zero_mask], f"{label} | zero-actual (n={int(zero_mask.sum())})")
+        if zero_mask.any() else None
+    )
+    nonzero_metrics = (
+        evaluate(y_true[nonzero_mask], y_pred[nonzero_mask], f"{label} | nonzero-actual (n={int(nonzero_mask.sum())})")
+        if nonzero_mask.any() else None
+    )
+    return {"zero_actual": zero_metrics, "nonzero_actual": nonzero_metrics}
 
 
 def naive_baseline(train_df: pd.DataFrame, eval_df: pd.DataFrame, horizon_days: int):
@@ -95,7 +169,7 @@ def describe_label_distribution(df: pd.DataFrame, label_col: str) -> None:
         )
 
 
-def train_xgboost(train_df, val_df, test_df, feature_cols, label_col, categorical_features):
+def train_xgboost(train_df, val_df, test_df, feature_cols, label_col, categorical_features, params):
     """
     Trained alongside LightGBM (not instead of) so accuracy can be compared
     directly on the same split rather than assumed. Uses XGBoost's native
@@ -116,13 +190,6 @@ def train_xgboost(train_df, val_df, test_df, feature_cols, label_col, categorica
     dval = xgb.DMatrix(val_df[feature_cols], label=val_df[label_col], enable_categorical=True)
     dtest = xgb.DMatrix(test_df[feature_cols], enable_categorical=True)
 
-    params = {
-        "objective": "reg:squarederror",
-        "eval_metric": "mae",
-        "eta": 0.05,
-        "max_depth": 6,
-        "tree_method": "hist",
-    }
     booster = xgb.train(
         params,
         dtrain,
@@ -190,17 +257,10 @@ def main(config_path=None):
         reference=train_set, categorical_feature=cat_features_present,
     )
 
-    params = {
-        "objective": "regression",
-        "metric": "mae",
-        "learning_rate": 0.05,
-        "num_leaves": 31,
-        "min_data_in_leaf": 20,
-        "verbosity": -1,
-    }
+    lgb_params = load_tuned_params("lightgbm", DEFAULT_LGB_PARAMS)
 
     model = lgb.train(
-        params,
+        lgb_params,
         train_set,
         valid_sets=[val_set],
         num_boost_round=500,
@@ -209,11 +269,14 @@ def main(config_path=None):
 
     test_preds = model.predict(test_df[feature_cols])
     model_metrics = evaluate(test_df[label_col].values, test_preds, "lightgbm")
+    model_segmented = evaluate_segmented(test_df[label_col].values, test_preds, "lightgbm")
 
+    xgb_params = load_tuned_params("xgboost", DEFAULT_XGB_PARAMS)
     xgb_booster, xgb_preds = train_xgboost(
-        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, xgb_params
     )
     xgb_metrics = evaluate(test_df[label_col].values, xgb_preds, "xgboost")
+    xgb_segmented = evaluate_segmented(test_df[label_col].values, xgb_preds, "xgboost")
 
     def _improvement(challenger_mae):
         if not baseline_metrics["mae"]:
@@ -242,7 +305,9 @@ def main(config_path=None):
                 "horizon_days": horizon,
                 "baseline": baseline_metrics,
                 "lightgbm": model_metrics,
+                "lightgbm_segmented": model_segmented,
                 "xgboost": xgb_metrics,
+                "xgboost_segmented": xgb_segmented,
                 "lower_test_mae": winner,
             },
             f,
