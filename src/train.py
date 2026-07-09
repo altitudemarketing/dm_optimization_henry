@@ -14,7 +14,8 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error
+import xgboost as xgb
+from sklearn.metrics import mean_absolute_error, r2_score
 
 from src.config_loader import load_config
 from src.dataset import time_aware_split
@@ -36,10 +37,19 @@ def _mape(y_true, y_pred) -> float:
 
 
 def evaluate(y_true, y_pred, label: str) -> dict:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
     mae = mean_absolute_error(y_true, y_pred)
+    # Computed manually rather than via sklearn's mean_squared_error(squared=False)
+    # since that param was deprecated/removed across recent sklearn versions --
+    # this avoids pinning to a narrow version range just for RMSE.
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    r2 = r2_score(y_true, y_pred)
     mape = _mape(y_true, y_pred)
-    print(f"[{label}] MAE={mae:.4f}  MAPE={mape:.4f}")
-    return {"mae": mae, "mape": mape}
+
+    print(f"[{label}] MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.4f}  MAPE={mape:.4f}")
+    return {"mae": mae, "rmse": rmse, "r2": r2, "mape": mape}
 
 
 def naive_baseline(train_df: pd.DataFrame, eval_df: pd.DataFrame, horizon_days: int):
@@ -62,6 +72,69 @@ def get_feature_columns(df: pd.DataFrame, label_col: str):
     return [c for c in df.columns if c not in exclude]
 
 
+def describe_label_distribution(df: pd.DataFrame, label_col: str) -> None:
+    """
+    MAE alone can be misleading on intermittent/low-count data like
+    conversions -- a model that predicts near-zero for everything can look
+    good on MAE if most entities have zero or near-zero conversions. This
+    print makes that visible instead of leaving it to guesswork.
+    """
+    values = df[label_col]
+    zero_rate = float((values == 0).mean())
+    print(
+        f"Label distribution for '{label_col}': zero_rate={zero_rate:.1%}, "
+        f"mean={values.mean():.3f}, median={values.median():.3f}, "
+        f"p90={values.quantile(0.9):.3f}, p99={values.quantile(0.99):.3f}, "
+        f"max={values.max():.3f}"
+    )
+    if zero_rate > 0.5:
+        print(
+            "Over half the labels are exactly zero -- interpret MAE/MAPE "
+            "cautiously here, and consider looking at performance specifically "
+            "on the nonzero subset (e.g. higher-volume ad groups) separately."
+        )
+
+
+def train_xgboost(train_df, val_df, test_df, feature_cols, label_col, categorical_features):
+    """
+    Trained alongside LightGBM (not instead of) so accuracy can be compared
+    directly on the same split rather than assumed. Uses XGBoost's native
+    categorical support (tree_method='hist', enable_categorical=True) to keep
+    the comparison apples-to-apples with LightGBM's categorical handling,
+    rather than one-hot encoding for just this model.
+    """
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    test_df = test_df.copy()
+    for col in categorical_features:
+        if col in feature_cols:
+            train_df[col] = train_df[col].astype("category")
+            val_df[col] = val_df[col].astype("category")
+            test_df[col] = test_df[col].astype("category")
+
+    dtrain = xgb.DMatrix(train_df[feature_cols], label=train_df[label_col], enable_categorical=True)
+    dval = xgb.DMatrix(val_df[feature_cols], label=val_df[label_col], enable_categorical=True)
+    dtest = xgb.DMatrix(test_df[feature_cols], enable_categorical=True)
+
+    params = {
+        "objective": "reg:squarederror",
+        "eval_metric": "mae",
+        "eta": 0.05,
+        "max_depth": 6,
+        "tree_method": "hist",
+    }
+    booster = xgb.train(
+        params,
+        dtrain,
+        num_boost_round=500,
+        evals=[(dval, "valid")],
+        early_stopping_rounds=30,
+        verbose_eval=50,
+    )
+    preds = booster.predict(dtest, iteration_range=(0, booster.best_iteration + 1))
+    return booster, preds
+
+
 def main(config_path=None):
     config = load_config(config_path)
     target_metric = config["model"]["target_metric"]
@@ -82,6 +155,7 @@ def main(config_path=None):
             f"Re-run `python -m scripts.build_dataset`."
         )
     df = df.dropna(subset=[label_col]).copy()
+    describe_label_distribution(df, label_col)
 
     for cat_col in CATEGORICAL_FEATURES:
         if cat_col in df.columns:
@@ -136,14 +210,29 @@ def main(config_path=None):
     test_preds = model.predict(test_df[feature_cols])
     model_metrics = evaluate(test_df[label_col].values, test_preds, "lightgbm")
 
-    if baseline_metrics["mae"]:
-        improvement = (baseline_metrics["mae"] - model_metrics["mae"]) / baseline_metrics["mae"] * 100
-        print(f"MAE improvement over baseline: {improvement:.1f}%")
+    xgb_booster, xgb_preds = train_xgboost(
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES
+    )
+    xgb_metrics = evaluate(test_df[label_col].values, xgb_preds, "xgboost")
+
+    def _improvement(challenger_mae):
+        if not baseline_metrics["mae"]:
+            return float("nan")
+        return (baseline_metrics["mae"] - challenger_mae) / baseline_metrics["mae"] * 100
+
+    print(f"LightGBM MAE improvement over baseline: {_improvement(model_metrics['mae']):.1f}%")
+    print(f"XGBoost MAE improvement over baseline: {_improvement(xgb_metrics['mae']):.1f}%")
+    winner = "lightgbm" if model_metrics["mae"] <= xgb_metrics["mae"] else "xgboost"
+    print(f"Lower test MAE: {winner}")
 
     output_dir = Path(config["paths"]["model_output"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_path = output_dir / f"{target_metric}_h{horizon}d.txt"
-    model.save_model(str(model_path))
+
+    lgb_path = output_dir / f"{target_metric}_h{horizon}d_lightgbm.txt"
+    model.save_model(str(lgb_path))
+
+    xgb_path = output_dir / f"{target_metric}_h{horizon}d_xgboost.json"
+    xgb_booster.save_model(str(xgb_path))
 
     metrics_path = output_dir / f"{target_metric}_h{horizon}d_metrics.json"
     with open(metrics_path, "w") as f:
@@ -153,12 +242,15 @@ def main(config_path=None):
                 "horizon_days": horizon,
                 "baseline": baseline_metrics,
                 "lightgbm": model_metrics,
+                "xgboost": xgb_metrics,
+                "lower_test_mae": winner,
             },
             f,
             indent=2,
         )
 
-    print(f"Saved model to {model_path}")
+    print(f"Saved LightGBM model to {lgb_path}")
+    print(f"Saved XGBoost model to {xgb_path}")
     print(f"Saved metrics to {metrics_path}")
 
 
