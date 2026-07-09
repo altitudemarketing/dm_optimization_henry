@@ -1,18 +1,18 @@
 {
   "target_metric": "conversions",
-  "n_trials": 70,
+  "n_trials": 50,
   "lightgbm": {
     "params": {
-      "learning_rate": 0.05264390983081775,
-      "num_leaves": 22,
-      "min_data_in_leaf": 23,
-      "feature_fraction": 0.7978487510930271,
-      "bagging_fraction": 0.9085330054775501,
-      "bagging_freq": 1,
-      "lambda_l1": 0.00746274619181253,
-      "lambda_l2": 5.66598406821201e-08
+      "learning_rate": 0.052410900176822296,
+      "num_leaves": 36,
+      "min_data_in_leaf": 21,
+      "feature_fraction": 0.7747899355942283,
+      "bagging_fraction": 0.9338482481555469,
+      "bagging_freq": 0,
+      "lambda_l1": 1.0665519651042463e-05,
+      "lambda_l2": 3.324015944088753e-08
     },
-    "val_mae": 0.24592056655030892
+    "val_mae": 0.24894092992078032
   },
   "xgboost": {
     "params": {
