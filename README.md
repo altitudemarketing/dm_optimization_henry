@@ -58,8 +58,11 @@ pipeline needs.
 # 1. Build the dataset (pulls from Snowflake, builds features + labels)
 python -m scripts.build_dataset
 
-# 2. Train baseline + LightGBM, see backtest metrics
+# 2. Train baseline, LightGBM, XGBoost, and a hurdle model; see backtest metrics
 python -m src.train
+
+# 3. Score the latest data into recommendation records
+python -m src.recommend
 ```
 
 Add `--use-cache` to `build_dataset` to skip the Snowflake pull and reuse
@@ -92,12 +95,57 @@ src/
   features.py              rolling-window, calendar, trend features (metric-agnostic)
   labels.py                leak-safe forward-looking label construction (metric-specific)
   dataset.py               time-aware train/val/test split
-  train.py                 baseline + LightGBM training and evaluation
+  train.py                 baseline + LightGBM + XGBoost + hurdle model training/evaluation
+  recommend.py             scores latest data into guardrailed recommendation records
 scripts/
   build_dataset.py         orchestrates the pull -> features -> labels -> parquet
   generate_synthetic_data.py   local test data, no Snowflake needed
+  tune_hyperparameters.py  Optuna hyperparameter search (separate, weekly-scheduled job)
 sql/pull_ad_group_daily_performance.sql   reference copy of the Snowflake query
 ```
+
+## Recommendation engine (`src/recommend.py`)
+
+Scores the most recent row of history for every active ad group against the
+trained model, compares the forecast to that entity's own trailing actual
+performance over the same-length window, and flags the ones worth a
+marketer's attention. Config lives under `recommendations:` in
+`config/config.yaml`.
+
+Guardrails, and why:
+- **Ranked within each client, not a fixed % threshold** — account sizes and
+  conversion volume vary enormously, and raw percent-change thresholds are
+  unstable on low-count data (see the MAPE discussion in `src/train.py`).
+  Only the most extreme `flag_percentile` (default 10%) of predicted-vs-baseline
+  swings *within that client's own ad groups* get surfaced.
+- **Spend floor** (`min_trailing_spend`) — suppresses recommendations on
+  trivial-spend ad groups entirely; there's little at stake, and it's exactly
+  where the model's zero-actual segment is least reliable directionally.
+- **Confidence segment tag** — every record is tagged `high` or `low`
+  confidence based on whether the entity has real trailing conversion volume,
+  tying directly back to the segmented eval in `src/train.py` (R² ~0.95 on
+  the nonzero segment vs. near-0/undefined on the always-zero segment).
+- **`requires_human_review: true` on every record, always** — this is
+  recommendation-only. Nothing here writes to Google Ads.
+
+Each run also `INSERT`s its output into
+`FIVETRAN_DATABASE.GOOGLE_ADS.ML_RECOMMENDATIONS` (see
+`sql/grant_ml_recommendations_write.sql`), which the Worker's
+`/api/report/google-ads/ml-recommendations` route reads back for the
+frontend's "ML Recommendations" tab. This needed a narrow, one-table
+`INSERT`+`SELECT` grant for `SLACK_BOT_RO` — it stays read-only everywhere
+else. Never `UPDATE`s or `DELETE`s an old run: every batch is left in place,
+tagged with its own `generated_at`, since that history is exactly what the
+feedback/outcome logging loop (task on the roadmap below) will need later.
+
+Action taxonomy (v1): `FORECASTED_ZERO_HIGH_SPEND` (red — forecasted ~0
+conversions despite real trailing spend), `FORECASTED_DECLINE` (yellow —
+among a client's steepest predicted drops), `FORECASTED_GROWTH_OPPORTUNITY`
+(green — among a client's strongest predicted gains). Deliberately avoids
+prescribing a specific bid/budget delta (e.g. "raise budget 23%") — that
+would need the causal/elasticity data this repo doesn't have yet (see
+"Why this doesn't include bid/budget change history" below). v1 tells you
+*what to look at and which direction*, not *the exact dial to turn*.
 
 ## Why this doesn't include bid/budget change history
 
@@ -114,11 +162,10 @@ phase, rather than trying to reconstruct it from imperfect historical logs.
 
 ## Where this fits
 
-1. **This repo**: forecast conversion volume per ad group, 7 days out.
-2. **Next**: rule-based recommendation layer on top of the forecast
-   (e.g. "predicted conversions dropping + budget underutilized -> flag for
-   review"), no learned causal effects yet.
-3. **Later**: recommendation API + frontend, with human approve/reject.
-4. **Later still**: feedback logging of every recommendation and its actual
+1. **This repo**: forecast conversion volume per ad group, 7 days out
+   (`src/train.py`), and turn that forecast into guardrailed recommendation
+   records (`src/recommend.py`) — no learned causal effects yet.
+2. **Next**: recommendation API + frontend, with human approve/reject.
+3. **Later still**: feedback logging of every recommendation and its actual
    outcome, which becomes the training data for autonomous bid/budget
    execution on narrow, low-risk, high-confidence actions.

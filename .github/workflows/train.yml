@@ -51,6 +51,21 @@ jobs:
       - name: Train model
         run: python -m src.train
 
+      - name: Score recommendations and upload to Snowflake
+        # Writes into FIVETRAN_DATABASE.GOOGLE_ADS.ML_RECOMMENDATIONS via a
+        # narrow INSERT-only grant (see sql/grant_ml_recommendations_write.sql)
+        # -- SLACK_BOT_RO stays read-only everywhere else. The Worker's
+        # /api/report/google-ads/ml-recommendations route reads this table
+        # back for the frontend's "ML Recommendations" tab.
+        env:
+          SNOWFLAKE_ACCOUNT_LOCATOR: ${{ secrets.SNOWFLAKE_ACCOUNT_LOCATOR }}
+          SNOWFLAKE_ACCOUNT_URL: ${{ secrets.SNOWFLAKE_ACCOUNT_URL }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_KEY_FILE: ./snowflake_key.p8
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        run: python -m src.recommend
+
       - name: Upload model + metrics
         uses: actions/upload-artifact@v4
         with:
@@ -58,6 +73,7 @@ jobs:
           path: |
             models/*.txt
             models/*.json
+            data/recommendations.json
           retention-days: 90
 
       - name: Clean up key file
