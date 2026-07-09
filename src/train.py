@@ -45,6 +45,17 @@ DEFAULT_XGB_PARAMS = {
     "eta": 0.05,
     "max_depth": 6,
 }
+# Classifier stage of the hurdle/two-stage model (see train_hurdle_model
+# below). Not currently tuned by Optuna -- these are reasonable fixed
+# defaults for a binary "does this entity convert at all" classifier.
+DEFAULT_LGB_CLF_PARAMS = {
+    "objective": "binary",
+    "metric": "auc",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "min_data_in_leaf": 20,
+    "verbosity": -1,
+}
 BEST_PARAMS_PATH = Path("config/best_params.json")
 
 
@@ -202,6 +213,83 @@ def train_xgboost(train_df, val_df, test_df, feature_cols, label_col, categorica
     return booster, preds
 
 
+def train_hurdle_model(train_df, val_df, test_df, feature_cols, label_col, categorical_features, reg_params, clf_params=None):
+    """
+    Two-stage ("hurdle") model for zero-inflated targets like conversions
+    (75%+ zero in our real data). A single regressor has to use the same
+    trees to learn both "predict ~0" and "predict the right nonzero
+    magnitude" -- the majority-zero rows dominate what the loss function
+    optimizes for, which is exactly the failure mode describe_label_distribution()
+    warns about.
+
+    This splits the job into two specialized models:
+      1. A classifier predicting P(label > 0) -- "will this entity convert at all".
+      2. A regressor trained ONLY on rows where the label is actually nonzero --
+         "given it converts, how much" -- so it isn't pulled toward zero by
+         the majority-zero rows.
+    Final prediction blends them: P(nonzero) x E[value | nonzero]. This is
+    the standard hurdle-model formulation for count/intermittent-demand data.
+    """
+    clf_params = clf_params or DEFAULT_LGB_CLF_PARAMS
+    cat_features_present = [c for c in categorical_features if c in feature_cols]
+
+    y_train_bin = (train_df[label_col] > 0).astype(int)
+    y_val_bin = (val_df[label_col] > 0).astype(int)
+
+    clf_train_set = lgb.Dataset(
+        train_df[feature_cols], label=y_train_bin, categorical_feature=cat_features_present,
+    )
+    clf_val_set = lgb.Dataset(
+        val_df[feature_cols], label=y_val_bin,
+        reference=clf_train_set, categorical_feature=cat_features_present,
+    )
+    classifier = lgb.train(
+        clf_params,
+        clf_train_set,
+        valid_sets=[clf_val_set],
+        num_boost_round=500,
+        callbacks=[lgb.early_stopping(30), lgb.log_evaluation(50)],
+    )
+
+    train_nonzero = train_df[train_df[label_col] > 0]
+    val_nonzero = val_df[val_df[label_col] > 0]
+    if len(train_nonzero) == 0 or len(val_nonzero) == 0:
+        raise ValueError(
+            "Hurdle model needs nonzero-label rows in both the train and "
+            "validation splits -- check describe_label_distribution() output; "
+            "zero_rate may be too close to 100% for this split size."
+        )
+
+    reg_train_set = lgb.Dataset(
+        train_nonzero[feature_cols], label=train_nonzero[label_col], categorical_feature=cat_features_present,
+    )
+    reg_val_set = lgb.Dataset(
+        val_nonzero[feature_cols], label=val_nonzero[label_col],
+        reference=reg_train_set, categorical_feature=cat_features_present,
+    )
+    regressor = lgb.train(
+        reg_params,
+        reg_train_set,
+        valid_sets=[reg_val_set],
+        num_boost_round=500,
+        callbacks=[lgb.early_stopping(30), lgb.log_evaluation(50)],
+    )
+
+    def predict(df):
+        p_nonzero = classifier.predict(df[feature_cols])
+        # The magnitude model never sees zero-labeled rows during training and
+        # can occasionally extrapolate slightly negative -- clip before blending.
+        magnitude = np.clip(regressor.predict(df[feature_cols]), 0, None)
+        return p_nonzero * magnitude
+
+    return {
+        "classifier": classifier,
+        "regressor": regressor,
+        "val_pred": predict(val_df),
+        "test_pred": predict(test_df),
+    }
+
+
 def main(config_path=None):
     config = load_config(config_path)
     target_metric = config["model"]["target_metric"]
@@ -278,6 +366,17 @@ def main(config_path=None):
     xgb_metrics = evaluate(test_df[label_col].values, xgb_preds, "xgboost")
     xgb_segmented = evaluate_segmented(test_df[label_col].values, xgb_preds, "xgboost")
 
+    # Hurdle/two-stage model: reuses the (possibly tuned) LightGBM regression
+    # hyperparameters for its magnitude stage, since that's already a LightGBM
+    # regressor solving essentially the same conditional-magnitude problem --
+    # just fit on a nonzero-only subset instead of the full data.
+    hurdle_result = train_hurdle_model(
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, reg_params=lgb_params,
+    )
+    hurdle_preds = hurdle_result["test_pred"]
+    hurdle_metrics = evaluate(test_df[label_col].values, hurdle_preds, "hurdle")
+    hurdle_segmented = evaluate_segmented(test_df[label_col].values, hurdle_preds, "hurdle")
+
     def _improvement(challenger_mae):
         if not baseline_metrics["mae"]:
             return float("nan")
@@ -285,7 +384,10 @@ def main(config_path=None):
 
     print(f"LightGBM MAE improvement over baseline: {_improvement(model_metrics['mae']):.1f}%")
     print(f"XGBoost MAE improvement over baseline: {_improvement(xgb_metrics['mae']):.1f}%")
-    winner = "lightgbm" if model_metrics["mae"] <= xgb_metrics["mae"] else "xgboost"
+    print(f"Hurdle MAE improvement over baseline: {_improvement(hurdle_metrics['mae']):.1f}%")
+
+    candidates = {"lightgbm": model_metrics["mae"], "xgboost": xgb_metrics["mae"], "hurdle": hurdle_metrics["mae"]}
+    winner = min(candidates, key=candidates.get)
     print(f"Lower test MAE: {winner}")
 
     output_dir = Path(config["paths"]["model_output"])
@@ -296,6 +398,11 @@ def main(config_path=None):
 
     xgb_path = output_dir / f"{target_metric}_h{horizon}d_xgboost.json"
     xgb_booster.save_model(str(xgb_path))
+
+    hurdle_clf_path = output_dir / f"{target_metric}_h{horizon}d_hurdle_classifier.txt"
+    hurdle_result["classifier"].save_model(str(hurdle_clf_path))
+    hurdle_reg_path = output_dir / f"{target_metric}_h{horizon}d_hurdle_regressor.txt"
+    hurdle_result["regressor"].save_model(str(hurdle_reg_path))
 
     metrics_path = output_dir / f"{target_metric}_h{horizon}d_metrics.json"
     with open(metrics_path, "w") as f:
@@ -308,6 +415,8 @@ def main(config_path=None):
                 "lightgbm_segmented": model_segmented,
                 "xgboost": xgb_metrics,
                 "xgboost_segmented": xgb_segmented,
+                "hurdle": hurdle_metrics,
+                "hurdle_segmented": hurdle_segmented,
                 "lower_test_mae": winner,
             },
             f,
@@ -316,6 +425,8 @@ def main(config_path=None):
 
     print(f"Saved LightGBM model to {lgb_path}")
     print(f"Saved XGBoost model to {xgb_path}")
+    print(f"Saved hurdle classifier to {hurdle_clf_path}")
+    print(f"Saved hurdle regressor to {hurdle_reg_path}")
     print(f"Saved metrics to {metrics_path}")
 
 
