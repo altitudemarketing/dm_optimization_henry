@@ -150,18 +150,27 @@ def _payload_to_dataframe(
 
 def _convert_column_types(df: pd.DataFrame, row_type: List[Dict[str, Any]]) -> pd.DataFrame:
     """
-    Snowflake's SQL API v2 returns raw/internal representations for several
-    types instead of human-readable strings, e.g.:
+    Snowflake's SQL API v2 returns raw/internal representations for some
+    types instead of human-readable strings:
       - DATE: integer number of days since 1970-01-01 (confirmed via a real
-        failure: "20611" is 2026-06-07, not a literal year)
+        failure: "20611" is 2026-06-07, not a literal year -- this one
+        genuinely needs conversion)
       - TIMESTAMP_*: (fractional) seconds since epoch
-      - FIXED (NUMBER/DECIMAL/INT): an integer that must be divided by
-        10**scale when the column has a nonzero scale, or it's off by a
-        factor of 10x/100x/etc. silently -- no crash, just wrong numbers.
+
+    FIXED (NUMBER/DECIMAL) values are NOT scaled integers needing division by
+    10**scale in this JSON response format -- they already come through as
+    correctly-formatted decimal strings. An earlier version of this function
+    divided by 10**scale based on the (wrong) assumption that FIXED behaved
+    like DATE; that silently understated SPEND by 100x (scale=2), caught by
+    comparing this pipeline's implied total spend against a direct Snowsight
+    query on the same date range ($5.1k implied vs. $502.6k actual). Do not
+    reintroduce scale division here without re-verifying against a real
+    aggregate query the same way.
 
     Converting based on the type Snowflake actually reports (row_type) is
-    more reliable than leaving downstream code to guess a column's format
-    from its name or a sample value.
+    still more reliable than leaving downstream code to guess a column's
+    format from its name or a sample value -- it's just DATE/TIMESTAMP that
+    need reinterpreting, not FIXED.
     """
     handled_types = {
         "date", "timestamp_ntz", "timestamp_ltz", "timestamp_tz",
@@ -198,8 +207,9 @@ def _convert_column_types(df: pd.DataFrame, row_type: List[Dict[str, Any]]) -> p
                 pd.to_numeric(seconds, errors="coerce"), unit="s", origin="unix"
             )
         elif sf_type == "fixed":
-            numeric = pd.to_numeric(df[name], errors="coerce")
-            df[name] = numeric / (10 ** scale) if scale else numeric
+            # Verified against ground truth (see docstring) -- no scale
+            # division needed, the string is already correctly formatted.
+            df[name] = pd.to_numeric(df[name], errors="coerce")
         elif sf_type == "real":
             df[name] = pd.to_numeric(df[name], errors="coerce")
         elif sf_type == "boolean":
