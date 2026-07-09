@@ -1,0 +1,22 @@
+# ML pipeline configuration.
+#
+# `model.target_metric` is the single knob that determines what the model
+# forecasts. See src/metrics.py for the full registry of supported metrics
+# and how to add new ones. Everything downstream (features, labels, training)
+# reads this value -- nothing else needs to change to switch metrics.
+
+model:
+  target_metric: conversions        # one of: conversions | cpa | roas | conversion_rate | ctr
+  grain: ad_group                   # forecasts are made per (client, campaign, ad_group)
+  forecast_horizon_days: 7          # how many days into the future to forecast
+  lookback_window_days: 30          # how much history to pull per entity
+  rolling_windows: [7, 14, 30]      # rolling feature windows, in days
+
+training:
+  test_size_days: 14                # held-out final evaluation window
+  validation_size_days: 14          # held-out window for early stopping
+
+paths:
+  raw_data_cache: data/raw_ad_group_daily_performance.parquet
+  processed_dataset: data/processed_dataset.parquet
+  model_output: models/
