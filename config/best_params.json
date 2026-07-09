@@ -1,0 +1,29 @@
+{
+  "target_metric": "conversions",
+  "n_trials": 70,
+  "lightgbm": {
+    "params": {
+      "learning_rate": 0.05264390983081775,
+      "num_leaves": 22,
+      "min_data_in_leaf": 23,
+      "feature_fraction": 0.7978487510930271,
+      "bagging_fraction": 0.9085330054775501,
+      "bagging_freq": 1,
+      "lambda_l1": 0.00746274619181253,
+      "lambda_l2": 5.66598406821201e-08
+    },
+    "val_mae": 0.24592056655030892
+  },
+  "xgboost": {
+    "params": {
+      "eta": 0.02440423348605143,
+      "max_depth": 4,
+      "min_child_weight": 2.716118332315085,
+      "subsample": 0.8572906393500376,
+      "colsample_bytree": 0.7224812718243604,
+      "reg_lambda": 3.7351118027374734e-05,
+      "reg_alpha": 0.0002793994105105841
+    },
+    "val_mae": 0.24144529572039705
+  }
+}
