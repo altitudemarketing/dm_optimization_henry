@@ -57,6 +57,18 @@ DEFAULT_LGB_CLF_PARAMS = {
     "min_data_in_leaf": 20,
     "verbosity": -1,
 }
+# CatBoost: a third, architecturally distinct open-source GBM (symmetric
+# trees grown depth-wise + ordered boosting, vs. LightGBM's leaf-wise and
+# XGBoost's level-wise growth) with native categorical support. Not currently
+# tuned by Optuna (see load_tuned_params below -- falls back to these
+# defaults until a catboost entry exists in best_params.json).
+DEFAULT_CATBOOST_PARAMS = {
+    "loss_function": "MAE",
+    "learning_rate": 0.05,
+    "depth": 6,
+    "l2_leaf_reg": 3.0,
+    "verbose": False,
+}
 BEST_PARAMS_PATH = Path("config/best_params.json")
 
 
@@ -179,6 +191,64 @@ def describe_label_distribution(df: pd.DataFrame, label_col: str) -> None:
             "cautiously here, and consider looking at performance specifically "
             "on the nonzero subset (e.g. higher-volume ad groups) separately."
         )
+
+
+def train_lightgbm(train_df, val_df, test_df, feature_cols, label_col, categorical_features, params):
+    """
+    Shared by the base LightGBM model and the Poisson/Tweedie objective
+    variants in main() -- same training path, only `params["objective"]`
+    (and metric) differ, so this is factored out rather than duplicated
+    three times.
+    """
+    cat_features_present = [c for c in categorical_features if c in feature_cols]
+    train_set = lgb.Dataset(
+        train_df[feature_cols], label=train_df[label_col],
+        categorical_feature=cat_features_present,
+    )
+    val_set = lgb.Dataset(
+        val_df[feature_cols], label=val_df[label_col],
+        reference=train_set, categorical_feature=cat_features_present,
+    )
+    model = lgb.train(
+        params,
+        train_set,
+        valid_sets=[val_set],
+        num_boost_round=500,
+        callbacks=[lgb.early_stopping(30), lgb.log_evaluation(50)],
+    )
+    preds = model.predict(test_df[feature_cols])
+    return model, preds
+
+
+def train_catboost(train_df, val_df, test_df, feature_cols, label_col, categorical_features, params):
+    """
+    CatBoost -- see DEFAULT_CATBOOST_PARAMS for why this is worth comparing
+    alongside LightGBM/XGBoost (different tree-growth strategy + native
+    categorical handling). CatBoost's Pool wants hashable categorical values
+    rather than pandas' Categorical dtype, so categorical columns are cast to
+    str here -- a separate cast from the "category" dtype used for LightGBM/
+    XGBoost elsewhere, not a shared one, to keep each model's data prep
+    independent and easy to reason about.
+    """
+    from catboost import CatBoostRegressor, Pool
+
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    test_df = test_df.copy()
+    cat_features_present = [c for c in categorical_features if c in feature_cols]
+    for col in cat_features_present:
+        train_df[col] = train_df[col].astype(str)
+        val_df[col] = val_df[col].astype(str)
+        test_df[col] = test_df[col].astype(str)
+
+    train_pool = Pool(train_df[feature_cols], label=train_df[label_col], cat_features=cat_features_present)
+    val_pool = Pool(val_df[feature_cols], label=val_df[label_col], cat_features=cat_features_present)
+    test_pool = Pool(test_df[feature_cols], cat_features=cat_features_present)
+
+    model = CatBoostRegressor(**params, iterations=500, early_stopping_rounds=30)
+    model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+    preds = model.predict(test_pool)
+    return model, preds
 
 
 def train_xgboost(train_df, val_df, test_df, feature_cols, label_col, categorical_features, params):
@@ -336,29 +406,41 @@ def main(config_path=None):
     baseline_preds = naive_baseline(train_df, test_df, horizon)
     baseline_metrics = evaluate(test_df[label_col].values, baseline_preds, "baseline")
 
-    cat_features_present = [c for c in CATEGORICAL_FEATURES if c in feature_cols]
-    train_set = lgb.Dataset(
-        train_df[feature_cols], label=train_df[label_col],
-        categorical_feature=cat_features_present,
-    )
-    val_set = lgb.Dataset(
-        val_df[feature_cols], label=val_df[label_col],
-        reference=train_set, categorical_feature=cat_features_present,
-    )
-
     lgb_params = load_tuned_params("lightgbm", DEFAULT_LGB_PARAMS)
-
-    model = lgb.train(
-        lgb_params,
-        train_set,
-        valid_sets=[val_set],
-        num_boost_round=500,
-        callbacks=[lgb.early_stopping(30), lgb.log_evaluation(50)],
+    model, test_preds = train_lightgbm(
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, lgb_params,
     )
-
-    test_preds = model.predict(test_df[feature_cols])
     model_metrics = evaluate(test_df[label_col].values, test_preds, "lightgbm")
     model_segmented = evaluate_segmented(test_df[label_col].values, test_preds, "lightgbm")
+
+    # Poisson/Tweedie objective variants of the same LightGBM model -- both
+    # are the standard loss functions for zero-inflated count/claim-style
+    # data (Tweedie in particular is the standard tool for this exact shape
+    # of problem in insurance claims modeling), so they may fit the
+    # 75%-zero distribution more naturally than plain MAE regression without
+    # the hurdle model's added complexity of training two separate models.
+    # Reuses the tuned structural hyperparameters (learning_rate, num_leaves,
+    # etc.) from the base model -- only the objective/metric actually differ.
+    poisson_params = {**lgb_params, "objective": "poisson", "metric": "poisson"}
+    poisson_model, poisson_preds = train_lightgbm(
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, poisson_params,
+    )
+    poisson_metrics = evaluate(test_df[label_col].values, poisson_preds, "lightgbm_poisson")
+    poisson_segmented = evaluate_segmented(test_df[label_col].values, poisson_preds, "lightgbm_poisson")
+
+    tweedie_params = {**lgb_params, "objective": "tweedie", "metric": "tweedie", "tweedie_variance_power": 1.5}
+    tweedie_model, tweedie_preds = train_lightgbm(
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, tweedie_params,
+    )
+    tweedie_metrics = evaluate(test_df[label_col].values, tweedie_preds, "lightgbm_tweedie")
+    tweedie_segmented = evaluate_segmented(test_df[label_col].values, tweedie_preds, "lightgbm_tweedie")
+
+    catboost_params = load_tuned_params("catboost", DEFAULT_CATBOOST_PARAMS)
+    catboost_model, catboost_preds = train_catboost(
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, catboost_params,
+    )
+    catboost_metrics = evaluate(test_df[label_col].values, catboost_preds, "catboost")
+    catboost_segmented = evaluate_segmented(test_df[label_col].values, catboost_preds, "catboost")
 
     xgb_params = load_tuned_params("xgboost", DEFAULT_XGB_PARAMS)
     xgb_booster, xgb_preds = train_xgboost(
@@ -399,6 +481,9 @@ def main(config_path=None):
         return (baseline_metrics["mae"] - challenger_mae) / baseline_metrics["mae"] * 100
 
     print(f"LightGBM MAE improvement over baseline: {_improvement(model_metrics['mae']):.1f}%")
+    print(f"LightGBM (Poisson) MAE improvement over baseline: {_improvement(poisson_metrics['mae']):.1f}%")
+    print(f"LightGBM (Tweedie) MAE improvement over baseline: {_improvement(tweedie_metrics['mae']):.1f}%")
+    print(f"CatBoost MAE improvement over baseline: {_improvement(catboost_metrics['mae']):.1f}%")
     print(f"XGBoost MAE improvement over baseline: {_improvement(xgb_metrics['mae']):.1f}%")
     print(f"Hurdle MAE improvement over baseline: {_improvement(hurdle_metrics['mae']):.1f}%")
     print(f"SARIMAX MAE improvement over baseline: {_improvement(sarimax_metrics['mae']):.1f}%")
@@ -406,6 +491,9 @@ def main(config_path=None):
 
     candidates = {
         "lightgbm": model_metrics["mae"],
+        "lightgbm_poisson": poisson_metrics["mae"],
+        "lightgbm_tweedie": tweedie_metrics["mae"],
+        "catboost": catboost_metrics["mae"],
         "xgboost": xgb_metrics["mae"],
         "hurdle": hurdle_metrics["mae"],
         "sarimax": sarimax_metrics["mae"],
@@ -413,12 +501,27 @@ def main(config_path=None):
     }
     winner = min(candidates, key=candidates.get)
     print(f"Lower test MAE: {winner}")
+    if winner not in ("lightgbm", "xgboost"):
+        print(
+            f"Note: '{winner}' won on test MAE, but src/recommend.py's inference path "
+            f"only supports 'xgboost'/'lightgbm' today -- it would need to be extended "
+            f"before this model could actually drive recommendations.primary_model."
+        )
 
     output_dir = Path(config["paths"]["model_output"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     lgb_path = output_dir / f"{target_metric}_h{horizon}d_lightgbm.txt"
     model.save_model(str(lgb_path))
+
+    poisson_path = output_dir / f"{target_metric}_h{horizon}d_lightgbm_poisson.txt"
+    poisson_model.save_model(str(poisson_path))
+
+    tweedie_path = output_dir / f"{target_metric}_h{horizon}d_lightgbm_tweedie.txt"
+    tweedie_model.save_model(str(tweedie_path))
+
+    catboost_path = output_dir / f"{target_metric}_h{horizon}d_catboost.cbm"
+    catboost_model.save_model(str(catboost_path))
 
     xgb_path = output_dir / f"{target_metric}_h{horizon}d_xgboost.json"
     xgb_booster.save_model(str(xgb_path))
@@ -445,6 +548,12 @@ def main(config_path=None):
                 "baseline": baseline_metrics,
                 "lightgbm": model_metrics,
                 "lightgbm_segmented": model_segmented,
+                "lightgbm_poisson": poisson_metrics,
+                "lightgbm_poisson_segmented": poisson_segmented,
+                "lightgbm_tweedie": tweedie_metrics,
+                "lightgbm_tweedie_segmented": tweedie_segmented,
+                "catboost": catboost_metrics,
+                "catboost_segmented": catboost_segmented,
                 "xgboost": xgb_metrics,
                 "xgboost_segmented": xgb_segmented,
                 "hurdle": hurdle_metrics,
@@ -465,6 +574,9 @@ def main(config_path=None):
         )
 
     print(f"Saved LightGBM model to {lgb_path}")
+    print(f"Saved LightGBM (Poisson) model to {poisson_path}")
+    print(f"Saved LightGBM (Tweedie) model to {tweedie_path}")
+    print(f"Saved CatBoost model to {catboost_path}")
     print(f"Saved XGBoost model to {xgb_path}")
     print(f"Saved hurdle classifier to {hurdle_clf_path}")
     print(f"Saved hurdle regressor to {hurdle_reg_path}")

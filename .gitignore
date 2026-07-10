@@ -4,3 +4,4 @@ models/
 __pycache__/
 *.pyc
 venv/
+catboost_info/
