@@ -449,6 +449,34 @@ def main(config_path=None):
     xgb_metrics = evaluate(test_df[label_col].values, xgb_preds, "xgboost")
     xgb_segmented = evaluate_segmented(test_df[label_col].values, xgb_preds, "xgboost")
 
+    # Poisson/Tweedie objective variants of XGBoost, mirroring the LightGBM
+    # variants above -- same rationale (matching the loss function to
+    # zero-inflated count data), applied to the other production GBM to see
+    # whether the objective-matching gain we saw with LightGBM (Poisson
+    # beating plain MAE) generalizes across libraries. Both use a log link
+    # internally (predictions are exp(raw tree output)), same as LightGBM's
+    # Tweedie objective -- worth watching for the same kind of occasional
+    # multiplicative blowup on outlier rows that LightGBM's Tweedie variant
+    # showed on real data (RMSE >> MAE was the tell there).
+    xgb_poisson_params = {**xgb_params, "objective": "count:poisson", "eval_metric": "poisson-nloglik"}
+    xgb_poisson_booster, xgb_poisson_preds = train_xgboost(
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, xgb_poisson_params,
+    )
+    xgb_poisson_metrics = evaluate(test_df[label_col].values, xgb_poisson_preds, "xgboost_poisson")
+    xgb_poisson_segmented = evaluate_segmented(test_df[label_col].values, xgb_poisson_preds, "xgboost_poisson")
+
+    xgb_tweedie_params = {
+        **xgb_params,
+        "objective": "reg:tweedie",
+        "eval_metric": "tweedie-nloglik@1.5",
+        "tweedie_variance_power": 1.5,
+    }
+    xgb_tweedie_booster, xgb_tweedie_preds = train_xgboost(
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, xgb_tweedie_params,
+    )
+    xgb_tweedie_metrics = evaluate(test_df[label_col].values, xgb_tweedie_preds, "xgboost_tweedie")
+    xgb_tweedie_segmented = evaluate_segmented(test_df[label_col].values, xgb_tweedie_preds, "xgboost_tweedie")
+
     # Hurdle/two-stage model: reuses the (possibly tuned) LightGBM regression
     # hyperparameters for its magnitude stage, since that's already a LightGBM
     # regressor solving essentially the same conditional-magnitude problem --
@@ -485,6 +513,8 @@ def main(config_path=None):
     print(f"LightGBM (Tweedie) MAE improvement over baseline: {_improvement(tweedie_metrics['mae']):.1f}%")
     print(f"CatBoost MAE improvement over baseline: {_improvement(catboost_metrics['mae']):.1f}%")
     print(f"XGBoost MAE improvement over baseline: {_improvement(xgb_metrics['mae']):.1f}%")
+    print(f"XGBoost (Poisson) MAE improvement over baseline: {_improvement(xgb_poisson_metrics['mae']):.1f}%")
+    print(f"XGBoost (Tweedie) MAE improvement over baseline: {_improvement(xgb_tweedie_metrics['mae']):.1f}%")
     print(f"Hurdle MAE improvement over baseline: {_improvement(hurdle_metrics['mae']):.1f}%")
     print(f"SARIMAX MAE improvement over baseline: {_improvement(sarimax_metrics['mae']):.1f}%")
     print(f"SARIMAX+GBM hybrid MAE improvement over baseline: {_improvement(hybrid_metrics['mae']):.1f}%")
@@ -495,6 +525,8 @@ def main(config_path=None):
         "lightgbm_tweedie": tweedie_metrics["mae"],
         "catboost": catboost_metrics["mae"],
         "xgboost": xgb_metrics["mae"],
+        "xgboost_poisson": xgb_poisson_metrics["mae"],
+        "xgboost_tweedie": xgb_tweedie_metrics["mae"],
         "hurdle": hurdle_metrics["mae"],
         "sarimax": sarimax_metrics["mae"],
         "sarimax_gbm_hybrid": hybrid_metrics["mae"],
@@ -526,6 +558,12 @@ def main(config_path=None):
     xgb_path = output_dir / f"{target_metric}_h{horizon}d_xgboost.json"
     xgb_booster.save_model(str(xgb_path))
 
+    xgb_poisson_path = output_dir / f"{target_metric}_h{horizon}d_xgboost_poisson.json"
+    xgb_poisson_booster.save_model(str(xgb_poisson_path))
+
+    xgb_tweedie_path = output_dir / f"{target_metric}_h{horizon}d_xgboost_tweedie.json"
+    xgb_tweedie_booster.save_model(str(xgb_tweedie_path))
+
     hurdle_clf_path = output_dir / f"{target_metric}_h{horizon}d_hurdle_classifier.txt"
     hurdle_result["classifier"].save_model(str(hurdle_clf_path))
     hurdle_reg_path = output_dir / f"{target_metric}_h{horizon}d_hurdle_regressor.txt"
@@ -556,6 +594,10 @@ def main(config_path=None):
                 "catboost_segmented": catboost_segmented,
                 "xgboost": xgb_metrics,
                 "xgboost_segmented": xgb_segmented,
+                "xgboost_poisson": xgb_poisson_metrics,
+                "xgboost_poisson_segmented": xgb_poisson_segmented,
+                "xgboost_tweedie": xgb_tweedie_metrics,
+                "xgboost_tweedie_segmented": xgb_tweedie_segmented,
                 "hurdle": hurdle_metrics,
                 "hurdle_segmented": hurdle_segmented,
                 "sarimax": sarimax_metrics,
@@ -578,6 +620,8 @@ def main(config_path=None):
     print(f"Saved LightGBM (Tweedie) model to {tweedie_path}")
     print(f"Saved CatBoost model to {catboost_path}")
     print(f"Saved XGBoost model to {xgb_path}")
+    print(f"Saved XGBoost (Poisson) model to {xgb_poisson_path}")
+    print(f"Saved XGBoost (Tweedie) model to {xgb_tweedie_path}")
     print(f"Saved hurdle classifier to {hurdle_clf_path}")
     print(f"Saved hurdle regressor to {hurdle_reg_path}")
     print(f"Saved SARIMAX+GBM hybrid residual model to {hybrid_path}")
