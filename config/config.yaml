@@ -51,8 +51,8 @@ optimization:
   window_days: 7                          # must match one of model.rolling_windows -- the grain the counterfactual is computed at
   min_trailing_spend: 50                   # $ -- suppress ad groups with too little at stake, same floor as recommendations.min_trailing_spend
   min_evidence_chunks: 8                   # parent campaign needs >= this many response-curve panel chunks (~2 months) before a dollar recommendation is trusted at all
-  candidate_pct_changes: [-0.20, -0.10, 0.10, 0.20]  # grid of spend changes evaluated per ad group
-  max_pct_change_per_cycle: 0.20           # hard cap on any single recommended change
+  max_pct_change_per_cycle: 0.50           # hard cap on any single recommended change -- the actual recommendation is solved for (any value up to this cap), not picked from a fixed grid; see src/optimize.py's docstring
+  pct_change_rounding: 0.01                # rounds the solved pct_change toward zero to the nearest this much (e.g. 0.347 -> 0.34) for readability -- never rounds in a direction that could tip a recommendation back outside its guardrail
   spend_range_tolerance: 0.15              # how far beyond the campaign's own historically observed spend range a candidate may push before being excluded as too speculative
   cpa_target_lookback_days: 90             # trailing window used to compute each campaign's avg value/conversion (for Target ROAS -> CPA) and each client's blended CPA fallback
   cpa_target_margin_pct: 0.05              # predicted CPA (conservative/lower-CI estimate) must clear the external CPA target by at least this much to recommend an increase -- see src/optimize.py's docstring for why this is compared to an EXTERNAL target, not the ad group's own average
