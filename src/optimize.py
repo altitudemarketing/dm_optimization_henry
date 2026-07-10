@@ -56,6 +56,20 @@ Guardrails (why each exists):
     enforces this project's stated limitation that the curve is "most
     trustworthy within each campaign's own historically observed spend range,
     and increasingly speculative extrapolating beyond it."
+  - max_pct_change_per_cycle / pct_change search: rather than testing a fixed
+    coarse grid of candidate pct changes (v1's original design -- only ever
+    {-20%,-10%,+10%,+20%}), _solve_increase_pct/_solve_decrease_pct directly
+    solve for the largest pct_change (any value, not just a grid point) whose
+    predicted effect still clears the relevant guardrail, via bisection --
+    both the CPA-vs-spend and conversion-loss-vs-spend relationships are
+    monotonic under this log-log curve, so a single boundary always exists.
+    max_pct_change_per_cycle is now purely the outer safety cap on that
+    search, not a menu of pre-picked options -- raising it directly raises
+    how large a single recommended change can be, and the resulting percentage
+    is whatever the guardrail boundary actually is (e.g. +34%), not snapped to
+    a round number. Recommendations are rounded conservatively (toward zero)
+    to config's pct_change_rounding for readability, never rounded in a
+    direction that could tip a recommendation back outside its guardrail.
   - Asymmetric confidence bounds, not the point estimate: increases are
     evaluated using the LOWER bound of beta's 95% CI (the most pessimistic
     plausible elasticity -- an increase only clears the bar if it looks good
@@ -124,6 +138,7 @@ evidence this module loads).
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -296,38 +311,14 @@ def _predicted_ratio(beta: float, current_spend: float, new_spend: float) -> flo
     return float(np.exp(beta * (np.log1p(new_spend) - np.log1p(current_spend))))
 
 
-def _evaluate_candidate(
-    pct_change: float,
-    current_spend: float,
-    current_conversions: float,
-    campaign_trailing_spend: float,
-    evidence: dict,
-    beta_low: float,
-    beta_high: float,
-    spend_range_tolerance: float,
-):
-    """
-    Evaluates one candidate ad-group spend change. Returns None if it fails
-    the campaign-level historical spend-range guardrail (infeasible, not
-    just unattractive). Otherwise returns a dict of the candidate's predicted
-    effects, computed with the conservative CI bound appropriate to its
-    direction (see module docstring).
-    """
+def _predict_at_pct(pct_change: float, current_spend: float, current_conversions: float, beta_used: float) -> dict:
+    """Predicted effects of one specific pct_change, at a given (already-chosen) beta."""
     new_spend = current_spend * (1 + pct_change)
     dollar_delta = new_spend - current_spend
-    new_campaign_spend = campaign_trailing_spend + dollar_delta
-
-    range_min = evidence["min_chunk_spend"] * (1 - spend_range_tolerance)
-    range_max = evidence["max_chunk_spend"] * (1 + spend_range_tolerance)
-    if not (range_min <= new_campaign_spend <= range_max):
-        return None
-
-    beta_used = beta_low if pct_change > 0 else beta_high
     ratio = _predicted_ratio(beta_used, current_spend, new_spend)
     predicted_conversions = current_conversions * ratio
     predicted_delta = predicted_conversions - current_conversions
     predicted_cpa = new_spend / predicted_conversions if predicted_conversions > 0 else float("inf")
-
     return {
         "pct_change": pct_change,
         "new_spend": new_spend,
@@ -339,19 +330,130 @@ def _evaluate_candidate(
     }
 
 
+def _feasible_range_bound(
+    direction: int,
+    current_spend: float,
+    campaign_trailing_spend: float,
+    evidence: dict,
+    spend_range_tolerance: float,
+    max_pct_change_per_cycle: float,
+) -> float:
+    """
+    The tightest feasible |pct_change| in one direction (+1 = increase, -1 =
+    decrease), intersecting the hard per-cycle cap with the campaign-level
+    historical spend-range guardrail (this ad group's dollar change added to
+    its campaign's current total can't push that total meaningfully outside
+    the campaign's own historically observed chunk-spend range -- see module
+    docstring). Always >= 0; 0 means no room at all in that direction.
+    """
+    if current_spend <= 0:
+        return 0.0
+    range_min = evidence["min_chunk_spend"] * (1 - spend_range_tolerance)
+    range_max = evidence["max_chunk_spend"] * (1 + spend_range_tolerance)
+
+    if direction > 0:
+        room_dollars = range_max - campaign_trailing_spend
+    else:
+        room_dollars = campaign_trailing_spend - range_min
+    range_bound_pct = room_dollars / current_spend
+    return max(0.0, min(max_pct_change_per_cycle, range_bound_pct))
+
+
+def _bisect_boundary(f_clears, safe_x: float, unsafe_x: float, iterations: int = 30) -> float:
+    """
+    f_clears(x) is True at safe_x and False at unsafe_x, and (this is the
+    part the caller is responsible for) monotonic in between -- true for
+    both the CPA-vs-increase and conversion-loss-vs-decrease relationships
+    here, since both derive from the same monotonic log-log ratio. Returns
+    the boundary point closest to unsafe_x that still clears -- i.e. the
+    largest-magnitude change that still satisfies the guardrail, rather than
+    settling for whichever point on a coarse fixed grid happened to clear.
+    """
+    lo, hi = safe_x, unsafe_x
+    for _ in range(iterations):
+        mid = (lo + hi) / 2
+        if f_clears(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _round_pct_conservative(pct: float, rounding: float) -> float:
+    """
+    Rounds a pct_change toward zero to the nearest `rounding` -- e.g. 0.347
+    with rounding=0.01 becomes 0.34, not 0.35. Always <= the original in
+    magnitude, so a value that just barely cleared a guardrail can't tip
+    over it purely from display rounding.
+    """
+    if rounding <= 0:
+        return pct
+    steps = math.floor(abs(pct) / rounding)
+    return math.copysign(steps * rounding, pct) if steps > 0 else 0.0
+
+
+def _solve_increase_pct(
+    current_spend: float, current_conversions: float, current_cpa,
+    beta_low: float, cpa_target, cpa_target_margin_pct: float, upper_bound_pct: float,
+) -> float:
+    """
+    Finds the largest pct_change in (0, upper_bound_pct] whose predicted CPA
+    (at the conservative lower-CI beta) still clears cpa_target's margin --
+    replaces testing a fixed coarse grid with directly solving for the actual
+    boundary, since predicted CPA rises monotonically with pct_change under
+    this log-log curve (diminishing returns -- see module docstring). Returns
+    0.0 if no positive pct_change clears (including if current_cpa already
+    fails to clear, in which case no increase ever could).
+    """
+    if upper_bound_pct <= 0 or cpa_target is None or current_cpa is None or current_conversions <= 0:
+        return 0.0
+    threshold = cpa_target * (1 - cpa_target_margin_pct)
+    if current_cpa >= threshold:
+        return 0.0  # already at/above threshold -- more spend only pushes CPA further up
+
+    def predicted_cpa_at(pct):
+        return _predict_at_pct(pct, current_spend, current_conversions, beta_low)["predicted_cpa"]
+
+    if predicted_cpa_at(upper_bound_pct) < threshold:
+        return upper_bound_pct
+    return _bisect_boundary(lambda p: predicted_cpa_at(p) < threshold, 0.0, upper_bound_pct)
+
+
+def _solve_decrease_pct(
+    current_spend: float, current_conversions: float,
+    beta_high: float, max_acceptable_conversion_loss_pct: float, lower_bound_pct: float,
+) -> float:
+    """
+    Mirrors _solve_increase_pct for the decrease side: finds the
+    largest-magnitude (most negative) pct_change in [lower_bound_pct, 0)
+    whose predicted conversion loss (at the conservative upper-CI beta)
+    still stays under the acceptable-loss threshold. Returns 0.0 if no
+    decrease is warranted (including zero current conversions, where the
+    ratio-based counterfactual is undefined).
+    """
+    if lower_bound_pct >= 0 or current_conversions <= 0:
+        return 0.0
+
+    def loss_frac_at(pct):
+        predicted_conversions = _predict_at_pct(pct, current_spend, current_conversions, beta_high)["predicted_conversions"]
+        return (current_conversions - predicted_conversions) / current_conversions
+
+    if loss_frac_at(lower_bound_pct) <= max_acceptable_conversion_loss_pct:
+        return lower_bound_pct
+    return _bisect_boundary(lambda p: loss_frac_at(p) <= max_acceptable_conversion_loss_pct, 0.0, lower_bound_pct)
+
+
 def build_spend_recommendations(config) -> pd.DataFrame:
     opt_config = config.get("optimization", {})
     window_days = opt_config.get("window_days", 7)
     min_trailing_spend = opt_config.get("min_trailing_spend", 50)
     min_evidence_chunks = opt_config.get("min_evidence_chunks", 8)
-    candidate_pct_changes = opt_config.get("candidate_pct_changes", [-0.20, -0.10, 0.10, 0.20])
-    max_pct_change_per_cycle = opt_config.get("max_pct_change_per_cycle", 0.20)
+    max_pct_change_per_cycle = opt_config.get("max_pct_change_per_cycle", 0.50)
+    pct_change_rounding = opt_config.get("pct_change_rounding", 0.01)
     spend_range_tolerance = opt_config.get("spend_range_tolerance", 0.15)
     cpa_target_margin_pct = opt_config.get("cpa_target_margin_pct", 0.05)
     cpa_target_lookback_days = opt_config.get("cpa_target_lookback_days", 90)
     max_acceptable_conversion_loss_pct = opt_config.get("max_acceptable_conversion_loss_pct", 0.05)
-
-    candidate_pct_changes = [p for p in candidate_pct_changes if abs(p) <= max_pct_change_per_cycle + 1e-9]
 
     response_curve_dir = Path(config["paths"].get("response_curve_output", "models/response_curve"))
     artifacts = _load_response_curve_artifacts(response_curve_dir)
@@ -471,60 +573,69 @@ def build_spend_recommendations(config) -> pd.DataFrame:
 
         confidence_tier = "high" if (evidence["has_stop_event"] or evidence["has_resume_event"]) else "medium"
 
-        candidates = [
-            _evaluate_candidate(
-                pct, row["current_spend"], row["current_conversions"], row["campaign_trailing_spend"],
-                evidence, beta_low, beta_high, spend_range_tolerance,
-            )
-            for pct in candidate_pct_changes
-        ]
-        candidates = [c for c in candidates if c is not None]
+        # Solve for the actual guardrail boundary in each direction (see
+        # module docstring) rather than testing a fixed coarse grid -- the
+        # resulting pct_change is whatever the boundary is (e.g. +34%), not
+        # snapped to a round number, and is bounded by both
+        # max_pct_change_per_cycle and the campaign-level spend-range guardrail.
+        upper_bound_pct = _feasible_range_bound(
+            +1, row["current_spend"], row["campaign_trailing_spend"], evidence,
+            spend_range_tolerance, max_pct_change_per_cycle,
+        )
+        lower_bound_pct = -_feasible_range_bound(
+            -1, row["current_spend"], row["campaign_trailing_spend"], evidence,
+            spend_range_tolerance, max_pct_change_per_cycle,
+        )
 
         # Increases are evaluated against an EXTERNAL CPA target, not the ad
         # group's own average -- see module docstring for why "does average
         # CPA improve" is structurally unclearable given beta << 1. No
         # increase is ever considered when no external target resolved for
         # this campaign (target_info is None) -- see pull_campaign_cpa_targets.
-        increase_candidates = []
+        increase_pct = 0.0
         if target_info is not None:
-            cpa_target = target_info["cpa_target"]
-            increase_candidates = [
-                c for c in candidates
-                if c["pct_change"] > 0
-                and c["predicted_cpa"] < cpa_target * (1 - cpa_target_margin_pct)
-            ]
-        decrease_candidates = [
-            c for c in candidates
-            if c["pct_change"] < 0
-            and abs(c["predicted_delta"]) <= row["current_conversions"] * max_acceptable_conversion_loss_pct
-        ]
+            increase_pct = _solve_increase_pct(
+                row["current_spend"], row["current_conversions"], row["current_cpa"],
+                beta_low, target_info["cpa_target"], cpa_target_margin_pct, upper_bound_pct,
+            )
+        increase_pct = _round_pct_conservative(increase_pct, pct_change_rounding)
 
-        if increase_candidates:
-            best = max(increase_candidates, key=lambda c: c["pct_change"])
+        decrease_pct = _solve_decrease_pct(
+            row["current_spend"], row["current_conversions"],
+            beta_high, max_acceptable_conversion_loss_pct, lower_bound_pct,
+        )
+        decrease_pct = _round_pct_conservative(decrease_pct, pct_change_rounding)
+
+        if increase_pct > 0:
+            best = _predict_at_pct(increase_pct, row["current_spend"], row["current_conversions"], beta_low)
             action = "INCREASE_SPEND"
             source_label = CPA_TARGET_SOURCE_LABELS.get(target_info["source"], "external CPA target")
             rationale = (
                 f"Even at the conservative (lower 95% CI) elasticity estimate of {best['beta_used']:.4f}, "
-                f"a {best['pct_change']*100:+.0f}% spend change (${best['dollar_delta']:+,.0f}) is predicted "
+                f"a {best['pct_change']*100:+.1f}% spend change (${best['dollar_delta']:+,.0f}) is predicted "
                 f"to reach a CPA of ${best['predicted_cpa']:.2f} -- at least {cpa_target_margin_pct*100:.0f}% "
-                f"under {source_label} of ${target_info['cpa_target']:.2f}."
+                f"under {source_label} of ${target_info['cpa_target']:.2f}. This is the largest change "
+                f"(within the {max_pct_change_per_cycle*100:.0f}% per-cycle cap and this campaign's historical "
+                f"spend range) that still clears that margin."
             )
-        elif decrease_candidates:
-            best = min(decrease_candidates, key=lambda c: c["pct_change"])
+        elif decrease_pct < 0:
+            best = _predict_at_pct(decrease_pct, row["current_spend"], row["current_conversions"], beta_high)
             action = "DECREASE_SPEND"
             rationale = (
                 f"Even at the conservative (upper 95% CI) elasticity estimate of {best['beta_used']:.4f}, "
-                f"a {best['pct_change']*100:+.0f}% spend change (${best['dollar_delta']:+,.0f}) is predicted "
+                f"a {best['pct_change']*100:.1f}% spend change (${best['dollar_delta']:+,.0f}) is predicted "
                 f"to cost only {abs(best['predicted_delta']):.2f} conversions "
-                f"(<= {max_acceptable_conversion_loss_pct*100:.0f}% of current) -- budget could be reallocated."
+                f"(<= {max_acceptable_conversion_loss_pct*100:.0f}% of current) -- budget could be reallocated. "
+                f"This is the largest cut (within the {max_pct_change_per_cycle*100:.0f}% per-cycle cap and this "
+                f"campaign's historical spend range) that still stays under that loss threshold."
             )
         else:
             best = None
             action = "HOLD"
             rationale = (
-                "No spend change within the tested range and this campaign's historically "
-                "observed spend range clears the conservative CI-bound guardrails in either "
-                "direction. No confident recommendation this run."
+                "No spend change within the per-cycle cap and this campaign's historically observed "
+                "spend range clears the conservative CI-bound guardrails in either direction. No "
+                "confident recommendation this run."
             )
 
         records.append({
