@@ -32,8 +32,36 @@ recommendations:
   flag_percentile: 0.10                   # only the most extreme 10% of predicted-vs-baseline swings, ranked within each CLIENT's own ad groups, get surfaced
   high_spend_zero_forecast_spend: 100     # $ trailing spend threshold for the highest-severity "forecasted zero, real spend" flag
 
+# Campaign-level spend -> conversions response-curve model ("Track A" -- see
+# src/response_curve.py's module docstring for the full design rationale).
+# Grain is CAMPAIGN, not ad group/keyword -- a direct consequence of a data
+# audit showing that's the only level with real historical budget-change
+# ground truth and enough natural spend variation to fit a curve from.
+response_curve:
+  history_days: 380                       # how far back to pull from CAMPAIGNS_MAT (~= its full available history)
+  window_days: 7                          # non-overlapping chunk size for the panel -- washes out day-of-week noise
+  min_avg_daily_spend: 5                  # $ -- excludes campaigns that are negligible-spend THROUGHOUT (not individual low chunks)
+  test_fraction: 0.2                      # fraction of most-recent periods held out as a genuine out-of-sample test
+  stop_resume_spend_threshold: 20         # $ per chunk -- below this counts as "off" for stop/resume transition detection
+
+# Optimization/guardrail v1 (see src/optimize.py's module docstring for the
+# full design rationale): turns response_curve's fitted elasticity into an
+# exact dollar spend-change recommendation per ad group.
+optimization:
+  window_days: 7                          # must match one of model.rolling_windows -- the grain the counterfactual is computed at
+  min_trailing_spend: 50                   # $ -- suppress ad groups with too little at stake, same floor as recommendations.min_trailing_spend
+  min_evidence_chunks: 8                   # parent campaign needs >= this many response-curve panel chunks (~2 months) before a dollar recommendation is trusted at all
+  candidate_pct_changes: [-0.20, -0.10, 0.10, 0.20]  # grid of spend changes evaluated per ad group
+  max_pct_change_per_cycle: 0.20           # hard cap on any single recommended change
+  spend_range_tolerance: 0.15              # how far beyond the campaign's own historically observed spend range a candidate may push before being excluded as too speculative
+  min_cpa_improvement_pct: 0.05            # required predicted CPA improvement (conservative/lower-CI estimate) to recommend an increase
+  max_acceptable_conversion_loss_pct: 0.05 # max predicted conversion loss (conservative/upper-CI estimate) tolerated to recommend a decrease
+
 paths:
   raw_data_cache: data/raw_ad_group_daily_performance.parquet
   processed_dataset: data/processed_dataset.parquet
   model_output: models/
   recommendations_output: data/recommendations.json
+  campaign_raw_cache: data/raw_campaign_daily_performance.parquet
+  response_curve_output: models/response_curve/
+  spend_recommendations_output: data/spend_recommendations.json

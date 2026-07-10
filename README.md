@@ -6,6 +6,95 @@ already sitting in Snowflake (`HOURLY_STATS_MAT`). This is stage one of a
 larger plan: forecast now, rule-based recommendations next, autonomous
 bid/budget execution later (see "Where this fits" below).
 
+## Response-curve model (spend -> conversions, "Track A")
+
+`src/response_curve.py` + `scripts/train_response_curve.py` estimate how
+campaign-level spend has historically related to conversions -- the
+foundation for recommending an *exact dollar change* (not just a forecast),
+which requires knowing the marginal effect of spend, not just what will
+happen under the status quo.
+
+Grain is **campaign**, not ad group or keyword -- a direct consequence of a
+data audit: keyword-level manual bids never change historically (94% of
+keywords report a bid of exactly 0 -- automated bidding dominates these
+accounts), ad-group-level budgets/bids aren't tracked at all, but campaign
+budget IS tracked with real change events
+(`AD_REPORTING_STAGING.STG_GOOGLE_ADS__CAMPAIGN_BUDGET_HISTORY`, though only
+~2 weeks deep as of this writing) and campaign daily spend has substantial
+natural variation (median coefficient of variation ~0.53) to estimate a
+curve from even without discrete change events.
+
+Design: two-way (campaign + calendar-week) fixed effects via the standard
+"within" transformation, log1p on spend/impressions/conversions (handles
+genuine zero-spend weeks from paused campaigns without special-casing),
+impressions as a control (to separate "more available auction opportunity
+this week" from "we chose to bid more of it" -- the central anticipation-bias
+risk with automated bidding), a genuine time-based train/test split, and a
+separate validation pass restricted to clean stop->resume (fully off -> on)
+transitions -- the cleanest natural experiment in this data, since a paused
+campaign isn't in any auction regardless of what an automated strategy might
+have predicted.
+
+This is explicitly **observational, not a randomized experiment** ("Track
+A"). It's a legitimate, guardrail-bounded first version -- most trustworthy
+within each campaign's own historically observed spend range -- not a
+substitute for the deliberate controlled-experiment system ("Track B") that
+would be the only way to fully validate/extend it. First real run: a small
+but statistically significant positive elasticity (beta ~0.13 on
+log1p(spend), p<0.001), with out-of-sample accuracy roughly matching a naive
+"campaign continues as before" baseline on the general population of test
+chunks, but meaningfully better specifically on the held-out stop/resume
+subset (n=13) -- consistent with the model adding real signal mainly where
+spend changes are large, and little where they aren't. Read: real but modest
+signal, not yet strong enough to drive exact dollar recommendations without
+further validation (more Track A history accumulating, and eventually Track
+B data).
+
+## Optimization/guardrail layer v1 (exact dollar spend recommendations)
+
+`src/optimize.py` (`python -m src.optimize`) turns the response curve above
+into an exact dollar spend-change recommendation per **ad group** -- the
+"recommend an amount to increase/decrease spend by, human approves/rejects"
+system from this project's system-design discussion. It's a separate,
+complementary module from `src/recommend.py`: recommend.py flags forecasted
+performance swings from the forecasting models (no dollar amount);
+optimize.py proposes a dollar amount from the causal response curve, for ad
+groups that clear its guardrails. Requires `scripts/build_dataset.py` and
+`scripts/train_response_curve.py` to have both been run first.
+
+Bridging campaign-grain to ad-group-grain: the curve was fit on campaign
+totals (see above), so applying it to one ad group only needs the *ratio* of
+predicted conversions at a new vs. current spend level -- the campaign fixed
+effect and the impressions control both cancel out of that ratio, so no
+ad-group-level fixed effect is needed. The explicit cost of this is an
+unavoidable stated assumption: **the campaign's fitted elasticity is assumed
+to apply uniformly across its ad groups**, which isn't separately validated
+(ad-group history can't support its own fixed-effects fit). The guardrails
+below exist specifically to compensate for that.
+
+Guardrails, in the order they're checked: a minimum trailing spend floor
+(too little at stake below it); a minimum evidence requirement per parent
+campaign (`optimization.min_evidence_chunks`, ~2 months of response-curve
+panel history) -- campaigns without enough history get `INSUFFICIENT_EVIDENCE`
+rather than a guessed number; a spend-range check that excludes any candidate
+pushing the campaign's total spend meaningfully outside its own historically
+observed range; and zero-conversion ad groups are skipped outright (the
+ratio math is undefined there, and it's this project's own
+least-reliable segment anyway). Most distinctively: increases are evaluated
+using the *lower* bound of the elasticity's 95% CI (the most pessimistic
+plausible effect), decreases using the *upper* bound (the most optimistic) --
+baking the model's own estimation uncertainty directly into the guardrail
+rather than trusting the point estimate.
+
+First real run against live data: 258 ad groups scored (of 545 total; the
+rest fell below the spend floor). 0 `INCREASE_SPEND`, 48 `DECREASE_SPEND`,
+3 `HOLD`, 207 `INSUFFICIENT_EVIDENCE`. Zero increases is the guardrails
+working as intended, not a bug: the elasticity's lower CI bound (~0.05) is
+small enough that few ad groups clear the 5%-CPA-improvement bar required to
+recommend spending more, given the model's actual demonstrated precision.
+Every record carries `requires_human_review=true`; nothing here writes to
+Google Ads.
+
 ## Config-driven target metrics
 
 `config/config.yaml` -> `model.target_metrics` (plural) is the list of
