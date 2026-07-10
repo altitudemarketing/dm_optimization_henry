@@ -19,6 +19,7 @@ from sklearn.metrics import mean_absolute_error, r2_score
 
 from src.config_loader import load_config
 from src.dataset import time_aware_split
+from src.metrics import get_metric
 from src.sarimax_model import run_sarimax, train_sarimax_gbm_hybrid
 
 CATEGORICAL_FEATURES = ["client_id", "channel_type"]
@@ -150,17 +151,31 @@ def evaluate_segmented(y_true, y_pred, label: str) -> dict:
     return {"zero_actual": zero_metrics, "nonzero_actual": nonzero_metrics}
 
 
-def naive_baseline(train_df: pd.DataFrame, eval_df: pd.DataFrame, horizon_days: int):
-    """Predicts the future value as horizon_days x each entity's trailing daily average."""
-    last_daily_avg = (
-        train_df.sort_values("stat_date")
-        .groupby("entity_id")["conversions_rolling_7d"]
-        .last()
-        / 7.0
-    )
-    fallback = last_daily_avg.mean()
-    preds = eval_df["entity_id"].map(last_daily_avg).fillna(fallback) * horizon_days
-    return preds.values
+def naive_baseline(train_df: pd.DataFrame, eval_df: pd.DataFrame, horizon_days: int, target_metric: str):
+    """
+    Predicts each entity's own recent trailing-7-day rate, projected to the
+    forecast horizon. For sum-type metrics (conversions, clicks) the label is
+    a horizon-days SUM, so the trailing 7-day sum is converted to a daily
+    rate and scaled up to horizon_days. For ratio-type metrics (cpa, cpc,
+    ...) the label is itself a ratio, not a windowed sum -- the trailing
+    7-day ratio is already the right shape/scale, so it's used as-is with no
+    horizon scaling. See src/metrics.py's MetricDefinition.is_ratio.
+    """
+    metric_def = get_metric(target_metric)
+    rolling_col = f"{target_metric}_rolling_7d"
+    if rolling_col not in train_df.columns:
+        raise ValueError(
+            f"Expected feature column '{rolling_col}' not found -- is a 7-day "
+            f"rolling window configured in config.yaml's model.rolling_windows?"
+        )
+
+    last_value = train_df.sort_values("stat_date").groupby("entity_id")[rolling_col].last()
+    fallback = last_value.mean()
+    mapped = eval_df["entity_id"].map(last_value).fillna(fallback)
+
+    if metric_def.is_ratio:
+        return mapped.values
+    return (mapped / 7.0 * horizon_days).values
 
 
 def get_feature_columns(df: pd.DataFrame, label_col: str):
@@ -307,6 +322,21 @@ def train_hurdle_model(train_df, val_df, test_df, feature_cols, label_col, categ
     y_train_bin = (train_df[label_col] > 0).astype(int)
     y_val_bin = (val_df[label_col] > 0).astype(int)
 
+    # A meaningful "will this convert at all" classifier needs BOTH classes
+    # present in train AND val. This fails for ratio-type metrics like cpa/cpc
+    # once undefined (zero-denominator) rows are dropped -- what's left is
+    # essentially always label > 0, so there's no "zero" class to learn from.
+    # Raise clearly rather than let LightGBM's binary/auc training silently
+    # produce a degenerate single-class model.
+    if y_train_bin.nunique() < 2 or y_val_bin.nunique() < 2:
+        raise ValueError(
+            f"Hurdle model needs both zero and nonzero label rows in train AND "
+            f"validation to fit a meaningful classifier -- '{label_col}' doesn't "
+            f"have both (train classes={sorted(y_train_bin.unique())}, "
+            f"val classes={sorted(y_val_bin.unique())}). Expected for ratio-type "
+            f"metrics once zero-denominator rows are dropped -- skip hurdle for this metric."
+        )
+
     clf_train_set = lgb.Dataset(
         train_df[feature_cols], label=y_train_bin, categorical_feature=cat_features_present,
     )
@@ -324,12 +354,6 @@ def train_hurdle_model(train_df, val_df, test_df, feature_cols, label_col, categ
 
     train_nonzero = train_df[train_df[label_col] > 0]
     val_nonzero = val_df[val_df[label_col] > 0]
-    if len(train_nonzero) == 0 or len(val_nonzero) == 0:
-        raise ValueError(
-            "Hurdle model needs nonzero-label rows in both the train and "
-            "validation splits -- check describe_label_distribution() output; "
-            "zero_rate may be too close to 100% for this split size."
-        )
 
     reg_train_set = lgb.Dataset(
         train_nonzero[feature_cols], label=train_nonzero[label_col], categorical_feature=cat_features_present,
@@ -361,26 +385,29 @@ def train_hurdle_model(train_df, val_df, test_df, feature_cols, label_col, categ
     }
 
 
-def main(config_path=None):
-    config = load_config(config_path)
-    target_metric = config["model"]["target_metric"]
+def run_training_for_metric(df_full: pd.DataFrame, config: dict, target_metric: str) -> dict:
+    """
+    Runs the full model comparison (LightGBM + Poisson/Tweedie variants,
+    CatBoost, XGBoost + Poisson/Tweedie variants, hurdle, SARIMAX + hybrid)
+    for a single target metric, saves every model + a metrics.json, and
+    returns a small summary dict for main()'s cross-metric printout.
+
+    `df_full` is the full processed dataset (all metrics' label_<metric>
+    columns already built by scripts/build_dataset.py) -- filtering to this
+    metric's usable rows happens here so each metric gets its own train/val/
+    test split sized to its own available labels.
+    """
+    metric_def = get_metric(target_metric)
     horizon = config["model"]["forecast_horizon_days"]
     label_col = f"label_{target_metric}"
 
-    processed_path = Path(config["paths"]["processed_dataset"])
-    if not processed_path.exists():
-        raise FileNotFoundError(
-            f"{processed_path} not found. Run `python -m scripts.build_dataset` first."
-        )
-
-    df = pd.read_parquet(processed_path)
-    if label_col not in df.columns:
+    if label_col not in df_full.columns:
         raise ValueError(
             f"Column '{label_col}' not found in processed dataset. "
-            f"Did config.yaml's target_metric change since the dataset was last built? "
-            f"Re-run `python -m scripts.build_dataset`."
+            f"Is '{target_metric}' listed in config.yaml's model.target_metrics? "
+            f"Re-run `python -m scripts.build_dataset` after changing it."
         )
-    df = df.dropna(subset=[label_col]).copy()
+    df = df_full.dropna(subset=[label_col]).copy()
     describe_label_distribution(df, label_col)
 
     for cat_col in CATEGORICAL_FEATURES:
@@ -403,7 +430,7 @@ def main(config_path=None):
             "Reduce training.test_size_days / validation_size_days, or pull more history."
         )
 
-    baseline_preds = naive_baseline(train_df, test_df, horizon)
+    baseline_preds = naive_baseline(train_df, test_df, horizon, target_metric)
     baseline_metrics = evaluate(test_df[label_col].values, baseline_preds, "baseline")
 
     lgb_params = load_tuned_params("lightgbm", DEFAULT_LGB_PARAMS)
@@ -480,28 +507,46 @@ def main(config_path=None):
     # Hurdle/two-stage model: reuses the (possibly tuned) LightGBM regression
     # hyperparameters for its magnitude stage, since that's already a LightGBM
     # regressor solving essentially the same conditional-magnitude problem --
-    # just fit on a nonzero-only subset instead of the full data.
-    hurdle_result = train_hurdle_model(
-        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, reg_params=lgb_params,
-    )
-    hurdle_preds = hurdle_result["test_pred"]
-    hurdle_metrics = evaluate(test_df[label_col].values, hurdle_preds, "hurdle")
-    hurdle_segmented = evaluate_segmented(test_df[label_col].values, hurdle_preds, "hurdle")
+    # just fit on a nonzero-only subset instead of the full data. Only
+    # meaningful when the label actually has both zero and nonzero rows (see
+    # train_hurdle_model's guard) -- skip cleanly otherwise rather than crash
+    # the whole multi-metric run over one metric's degenerate edge case.
+    hurdle_result = hurdle_metrics = hurdle_segmented = None
+    try:
+        hurdle_result = train_hurdle_model(
+            train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, reg_params=lgb_params,
+        )
+        hurdle_preds = hurdle_result["test_pred"]
+        hurdle_metrics = evaluate(test_df[label_col].values, hurdle_preds, "hurdle")
+        hurdle_segmented = evaluate_segmented(test_df[label_col].values, hurdle_preds, "hurdle")
+    except ValueError as e:
+        print(f"Skipping hurdle model for '{target_metric}': {e}")
 
     # SARIMAX benchmark + SARIMAX/LightGBM hybrid -- see src/sarimax_model.py
-    # for the full design and its simplifications. These need each entity's
-    # raw historical conversions series (not just engineered features), so
-    # the pre-split `df` is passed in alongside the train/val/test splits.
-    sarimax_result = run_sarimax(df, train_df, val_df, test_df, horizon)
-    sarimax_metrics = evaluate(test_df[label_col].values, sarimax_result["test_pred"], "sarimax")
-    sarimax_segmented = evaluate_segmented(test_df[label_col].values, sarimax_result["test_pred"], "sarimax")
+    # for the full design and its simplifications. Only valid for non-ratio
+    # metrics (a ratio-type label isn't a single summable per-entity series --
+    # see MetricDefinition.is_ratio). These need each entity's raw historical
+    # series (not just engineered features), so the pre-split `df` is passed
+    # in alongside the train/val/test splits.
+    sarimax_result = sarimax_metrics = sarimax_segmented = None
+    hybrid_result = hybrid_metrics = hybrid_segmented = None
+    if not metric_def.is_ratio:
+        sarimax_result = run_sarimax(df, train_df, val_df, test_df, horizon, raw_column=target_metric)
+        sarimax_metrics = evaluate(test_df[label_col].values, sarimax_result["test_pred"], "sarimax")
+        sarimax_segmented = evaluate_segmented(test_df[label_col].values, sarimax_result["test_pred"], "sarimax")
 
-    hybrid_result = train_sarimax_gbm_hybrid(
-        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, sarimax_result, lgb_params,
-    )
-    hybrid_preds = hybrid_result["test_pred"]
-    hybrid_metrics = evaluate(test_df[label_col].values, hybrid_preds, "sarimax_gbm_hybrid")
-    hybrid_segmented = evaluate_segmented(test_df[label_col].values, hybrid_preds, "sarimax_gbm_hybrid")
+        hybrid_result = train_sarimax_gbm_hybrid(
+            train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, sarimax_result, lgb_params,
+        )
+        hybrid_preds = hybrid_result["test_pred"]
+        hybrid_metrics = evaluate(test_df[label_col].values, hybrid_preds, "sarimax_gbm_hybrid")
+        hybrid_segmented = evaluate_segmented(test_df[label_col].values, hybrid_preds, "sarimax_gbm_hybrid")
+    else:
+        print(
+            f"Skipping SARIMAX/hybrid for '{target_metric}': ratio-type metrics aren't a single "
+            f"summable per-entity series (see src/sarimax_model.py) -- would need forecasting "
+            f"each raw component separately and combining, not attempted here."
+        )
 
     def _improvement(challenger_mae):
         if not baseline_metrics["mae"]:
@@ -515,9 +560,11 @@ def main(config_path=None):
     print(f"XGBoost MAE improvement over baseline: {_improvement(xgb_metrics['mae']):.1f}%")
     print(f"XGBoost (Poisson) MAE improvement over baseline: {_improvement(xgb_poisson_metrics['mae']):.1f}%")
     print(f"XGBoost (Tweedie) MAE improvement over baseline: {_improvement(xgb_tweedie_metrics['mae']):.1f}%")
-    print(f"Hurdle MAE improvement over baseline: {_improvement(hurdle_metrics['mae']):.1f}%")
-    print(f"SARIMAX MAE improvement over baseline: {_improvement(sarimax_metrics['mae']):.1f}%")
-    print(f"SARIMAX+GBM hybrid MAE improvement over baseline: {_improvement(hybrid_metrics['mae']):.1f}%")
+    if hurdle_metrics:
+        print(f"Hurdle MAE improvement over baseline: {_improvement(hurdle_metrics['mae']):.1f}%")
+    if sarimax_metrics:
+        print(f"SARIMAX MAE improvement over baseline: {_improvement(sarimax_metrics['mae']):.1f}%")
+        print(f"SARIMAX+GBM hybrid MAE improvement over baseline: {_improvement(hybrid_metrics['mae']):.1f}%")
 
     candidates = {
         "lightgbm": model_metrics["mae"],
@@ -527,12 +574,15 @@ def main(config_path=None):
         "xgboost": xgb_metrics["mae"],
         "xgboost_poisson": xgb_poisson_metrics["mae"],
         "xgboost_tweedie": xgb_tweedie_metrics["mae"],
-        "hurdle": hurdle_metrics["mae"],
-        "sarimax": sarimax_metrics["mae"],
-        "sarimax_gbm_hybrid": hybrid_metrics["mae"],
     }
+    if hurdle_metrics:
+        candidates["hurdle"] = hurdle_metrics["mae"]
+    if sarimax_metrics:
+        candidates["sarimax"] = sarimax_metrics["mae"]
+        candidates["sarimax_gbm_hybrid"] = hybrid_metrics["mae"]
+
     winner = min(candidates, key=candidates.get)
-    print(f"Lower test MAE: {winner}")
+    print(f"Lower test MAE for '{target_metric}': {winner}")
     if winner not in ("lightgbm", "xgboost"):
         print(
             f"Note: '{winner}' won on test MAE, but src/recommend.py's inference path "
@@ -564,18 +614,23 @@ def main(config_path=None):
     xgb_tweedie_path = output_dir / f"{target_metric}_h{horizon}d_xgboost_tweedie.json"
     xgb_tweedie_booster.save_model(str(xgb_tweedie_path))
 
-    hurdle_clf_path = output_dir / f"{target_metric}_h{horizon}d_hurdle_classifier.txt"
-    hurdle_result["classifier"].save_model(str(hurdle_clf_path))
-    hurdle_reg_path = output_dir / f"{target_metric}_h{horizon}d_hurdle_regressor.txt"
-    hurdle_result["regressor"].save_model(str(hurdle_reg_path))
+    if hurdle_result:
+        hurdle_clf_path = output_dir / f"{target_metric}_h{horizon}d_hurdle_classifier.txt"
+        hurdle_result["classifier"].save_model(str(hurdle_clf_path))
+        hurdle_reg_path = output_dir / f"{target_metric}_h{horizon}d_hurdle_regressor.txt"
+        hurdle_result["regressor"].save_model(str(hurdle_reg_path))
+        print(f"Saved hurdle classifier to {hurdle_clf_path}")
+        print(f"Saved hurdle regressor to {hurdle_reg_path}")
 
     # Note: the per-entity SARIMAX models themselves aren't saved -- there can
     # be hundreds of them (one per active ad group), they're cheap to refit,
     # and every other model in this pipeline is already retrained from scratch
     # each run rather than persisted, so this stays consistent with that.
     # Only the hybrid's residual GBM (a single model) is saved.
-    hybrid_path = output_dir / f"{target_metric}_h{horizon}d_sarimax_gbm_hybrid.txt"
-    hybrid_result["residual_model"].save_model(str(hybrid_path))
+    if hybrid_result:
+        hybrid_path = output_dir / f"{target_metric}_h{horizon}d_sarimax_gbm_hybrid.txt"
+        hybrid_result["residual_model"].save_model(str(hybrid_path))
+        print(f"Saved SARIMAX+GBM hybrid residual model to {hybrid_path}")
 
     metrics_path = output_dir / f"{target_metric}_h{horizon}d_metrics.json"
     with open(metrics_path, "w") as f:
@@ -602,11 +657,14 @@ def main(config_path=None):
                 "hurdle_segmented": hurdle_segmented,
                 "sarimax": sarimax_metrics,
                 "sarimax_segmented": sarimax_segmented,
-                "sarimax_fit_diagnostics": {
-                    "n_fit": sarimax_result["n_fit"],
-                    "n_fallback": sarimax_result["n_fallback"],
-                    "n_capped": sarimax_result["n_capped"],
-                },
+                "sarimax_fit_diagnostics": (
+                    {
+                        "n_fit": sarimax_result["n_fit"],
+                        "n_fallback": sarimax_result["n_fallback"],
+                        "n_capped": sarimax_result["n_capped"],
+                    }
+                    if sarimax_result else None
+                ),
                 "sarimax_gbm_hybrid": hybrid_metrics,
                 "sarimax_gbm_hybrid_segmented": hybrid_segmented,
                 "lower_test_mae": winner,
@@ -622,10 +680,35 @@ def main(config_path=None):
     print(f"Saved XGBoost model to {xgb_path}")
     print(f"Saved XGBoost (Poisson) model to {xgb_poisson_path}")
     print(f"Saved XGBoost (Tweedie) model to {xgb_tweedie_path}")
-    print(f"Saved hurdle classifier to {hurdle_clf_path}")
-    print(f"Saved hurdle regressor to {hurdle_reg_path}")
-    print(f"Saved SARIMAX+GBM hybrid residual model to {hybrid_path}")
     print(f"Saved metrics to {metrics_path}")
+
+    return {"winner": winner, "winner_mae": candidates[winner], "baseline_mae": baseline_metrics["mae"]}
+
+
+def main(config_path=None):
+    config = load_config(config_path)
+
+    processed_path = Path(config["paths"]["processed_dataset"])
+    if not processed_path.exists():
+        raise FileNotFoundError(
+            f"{processed_path} not found. Run `python -m scripts.build_dataset` first."
+        )
+    df_full = pd.read_parquet(processed_path)
+
+    target_metrics = config["model"].get("target_metrics") or [config["model"]["target_metric"]]
+
+    summaries = {}
+    for target_metric in target_metrics:
+        print(f"\n{'=' * 70}\nTraining models for target_metric='{target_metric}'\n{'=' * 70}")
+        summaries[target_metric] = run_training_for_metric(df_full, config, target_metric)
+
+    if len(target_metrics) > 1:
+        print(f"\n{'=' * 70}\nSummary across all {len(target_metrics)} metrics\n{'=' * 70}")
+        for target_metric, summary in summaries.items():
+            print(
+                f"{target_metric}: winner={summary['winner']} (test MAE={summary['winner_mae']:.4f}), "
+                f"baseline MAE={summary['baseline_mae']:.4f}"
+            )
 
 
 if __name__ == "__main__":

@@ -6,23 +6,64 @@ already sitting in Snowflake (`HOURLY_STATS_MAT`). This is stage one of a
 larger plan: forecast now, rule-based recommendations next, autonomous
 bid/budget execution later (see "Where this fits" below).
 
-## Config-driven target metric
+## Config-driven target metrics
 
-`config/config.yaml` -> `model.target_metric` is the only thing that
-determines what the model predicts. Supported metrics live in the registry
-in `src/metrics.py` (`conversions`, `cpa`, `roas`, `conversion_rate`, `ctr`);
-each one just declares which raw columns it needs and how to compute it.
+`config/config.yaml` -> `model.target_metrics` (plural) is the list of
+metrics `scripts/build_dataset.py` labels and `src/train.py` trains a full
+model suite for. Supported metrics live in the registry in `src/metrics.py`
+(`conversions`, `clicks`, `cpa`, `cpc`, `roas`, `conversion_rate`, `ctr`);
+each one just declares which raw columns it needs, how to compute it, and
+whether it's a ratio (`is_ratio`) rather than a directly summable
+count/currency total.
 
-Switching targets later is: edit `target_metric` in the config, then
+These are **independent models, not one joint multi-output model** — each
+metric in `target_metrics` gets its own full comparison (LightGBM +
+Poisson/Tweedie variants, CatBoost, XGBoost + Poisson/Tweedie variants,
+hurdle, SARIMAX + hybrid where applicable) and its own saved models/
+`models/<metric>_h<horizon>d_metrics.json`, run in a loop by `src/train.py`'s
+`main()`. This was a deliberate choice over a shared-tree joint model
+(e.g. CatBoost's `MultiRMSE`) to avoid touching `src/recommend.py`, the
+prediction-accuracy Snowflake table, and the frontend tabs, all of which
+still assume one scalar prediction per entity — and because specialist models
+per metric are generally more accurate than one model splitting its capacity
+across differently-shaped targets.
+
+Two model families are metric-conditional, not run unconditionally for
+every metric:
+- **Hurdle** only runs when the label actually has both zero and nonzero
+  rows in train AND val (see `train_hurdle_model`'s guard in `src/train.py`).
+  This is automatically true for genuinely zero-inflated metrics
+  (`conversions`, and `clicks` at ~30% zero on real data) and automatically
+  false for ratio metrics like `cpa`/`cpc` once undefined (zero-denominator)
+  rows are dropped — those end up effectively always-nonzero, so a "will
+  this convert at all" classifier has nothing to learn. Skipped cleanly with
+  a printed explanation rather than erroring.
+- **SARIMAX + the SARIMAX/GBM hybrid** only run for non-ratio metrics
+  (`MetricDefinition.is_ratio == False`). SARIMAX forecasts a single
+  per-entity raw series and sums it over the horizon — that has no direct
+  meaning for a ratio label (`cpa`'s label is future-spend-sum /
+  future-conversions-sum, not a summable series of its own). Extending this
+  to ratio metrics would mean forecasting each raw component separately and
+  combining them, not attempted here.
+
+`model.target_metric` (singular) still exists separately and is read by
+`src/recommend.py`/`src/evaluate_accuracy.py` — the live recommendation-
+scoring model and prediction-accuracy monitoring still act on one scalar
+metric (`conversions`) for now. Extending recommendations/accuracy-tracking
+to the other 3 metrics is a bigger follow-on task (new guardrail schema,
+frontend sections, Snowflake tracking per metric) not attempted here.
+
+Adding a metric to the sweep is: add it to both the registry in
+`src/metrics.py` and `target_metrics` in the config, then
 ```
 python -m scripts.build_dataset
 python -m src.train
 ```
-No changes needed to the Snowflake pull, feature engineering, or training
-code — this was verified by actually running the pipeline end-to-end against
-both `conversions` and `cpa` during development. What *does* need redoing
-after a switch: backtesting/tuning (a different metric has a different error
-distribution) and any recommendation thresholds built on top of the forecast.
+No other changes needed to the Snowflake pull or feature engineering code —
+features are metric-agnostic by design. What *does* need redoing after
+adding a metric: backtesting/tuning (a different metric has a different
+error distribution) and any recommendation thresholds built on top of the
+forecast, if you extend recommendations to it.
 
 ## Data source
 

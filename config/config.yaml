@@ -1,12 +1,20 @@
 # ML pipeline configuration.
 #
-# `model.target_metric` is the single knob that determines what the model
-# forecasts. See src/metrics.py for the full registry of supported metrics
-# and how to add new ones. Everything downstream (features, labels, training)
-# reads this value -- nothing else needs to change to switch metrics.
+# `model.target_metric` (singular) is read by src/recommend.py and
+# src/evaluate_accuracy.py -- the live recommendation-scoring model still
+# acts on one scalar prediction per entity for now.
+#
+# `model.target_metrics` (plural) is read by scripts/build_dataset.py (builds
+# a label_<metric> column for each) and src/train.py (trains + compares the
+# full model suite for each, independently -- see the "4 independent models"
+# design decision in this project's history, not one joint multi-output
+# model). See src/metrics.py for the full registry of supported metrics and
+# how to add new ones. Everything downstream (features, labels, training)
+# reads these values -- nothing else needs to change to add a metric.
 
 model:
-  target_metric: conversions        # one of: conversions | cpa | roas | conversion_rate | ctr
+  target_metric: conversions                          # one of: conversions | clicks | cpa | cpc | roas | conversion_rate | ctr
+  target_metrics: [conversions, clicks, cpc, cpa]      # every metric build_dataset.py labels + train.py trains a full model suite for
   grain: ad_group                   # forecasts are made per (client, campaign, ad_group)
   forecast_horizon_days: 7          # how many days into the future to forecast
   lookback_window_days: 30          # how much history to pull per entity

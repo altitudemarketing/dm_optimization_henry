@@ -114,15 +114,21 @@ def _fit_one_entity(train_series: pd.Series, order, seasonal_order):
         return None
 
 
-def run_sarimax(df, train_df, val_df, test_df, horizon_days,
+def run_sarimax(df, train_df, val_df, test_df, horizon_days, raw_column="conversions",
                  order=DEFAULT_ORDER, seasonal_order=DEFAULT_SEASONAL_ORDER):
     """
-    Fits one SARIMAX per entity on train-period daily conversions, then
-    produces horizon-days-ahead-summed predictions for train (in-sample
+    Fits one SARIMAX per entity on train-period daily `raw_column` values,
+    then produces horizon-days-ahead-summed predictions for train (in-sample
     fitted), val, and test rows -- everything evaluate()/evaluate_segmented()
     and the residual hybrid need. `df` should be the full processed dataset
-    (same one train.py loads) so each entity's true historical conversions
-    are available; train_df/val_df/test_df are the already-split subsets.
+    (same one train.py loads) so each entity's true historical values are
+    available; train_df/val_df/test_df are the already-split subsets.
+
+    `raw_column` only makes sense for sum-type metrics (conversions, clicks)
+    whose label is a horizon-days sum of a single raw column -- ratio-type
+    metrics (cpa, cpc, ...) aren't a single summable per-entity series (their
+    label is future-sum-A / future-sum-B), so src/train.py only calls this
+    for non-ratio metrics. See src/metrics.py's MetricDefinition.is_ratio.
 
     Returns a dict with train_pred/val_pred/test_pred (arrays aligned to each
     split's row order) plus fit diagnostics (n_fit, n_fallback).
@@ -141,7 +147,7 @@ def run_sarimax(df, train_df, val_df, test_df, horizon_days,
     cap_by_entity = {}          # hard upper bound on this entity's predicted horizon-day sum
 
     for entity_id, g in df.groupby("entity_id"):
-        s = g.set_index(pd.to_datetime(g["stat_date"]))["conversions"].sort_index()
+        s = g.set_index(pd.to_datetime(g["stat_date"]))[raw_column].sort_index()
         s = s.groupby(level=0).sum()  # defensive, in case of any duplicate dates
         full_series = _complete_daily_index(s)
         history_by_entity[entity_id] = full_series

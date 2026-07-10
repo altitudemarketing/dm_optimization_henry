@@ -1,7 +1,8 @@
 """
 Orchestrates the full dataset build: pull raw data from Snowflake (or a cached
 parquet), aggregate to daily grain, build rolling-window features, build
-labels for the configured target metric, and save the processed dataset.
+labels for every metric in config.yaml's model.target_metrics, and save the
+processed dataset.
 
 Usage:
     python -m scripts.build_dataset [--config path/to/config.yaml] [--use-cache]
@@ -9,6 +10,12 @@ Usage:
 --use-cache skips the Snowflake pull and reuses whatever's at
 paths.raw_data_cache (handy for iterating on features/labels, or for running
 against scripts/generate_synthetic_data.py output without credentials).
+
+Builds a label_<metric> column for every entry in model.target_metrics (all
+sharing the same metric-agnostic features above) into one processed dataset,
+so src/train.py can train/compare models for all of them without rebuilding
+the dataset per metric. Falls back to model.target_metric (singular) if
+target_metrics isn't set, for backward compatibility.
 """
 
 import argparse
@@ -49,12 +56,16 @@ def main(config_path=None, use_cache=False):
           f"{len(df)} entity-days")
 
     df = build_rolling_features(df, config["model"]["rolling_windows"])
-    df = build_labels(df, config["model"]["target_metric"], config["model"]["forecast_horizon_days"])
 
-    label_col = f"label_{config['model']['target_metric']}"
-    usable = df[label_col].notna().sum()
-    print(f"{usable} / {len(df)} rows have a complete forward-looking label "
-          f"(rest are near the end of the available history)")
+    target_metrics = config["model"].get("target_metrics") or [config["model"]["target_metric"]]
+    horizon = config["model"]["forecast_horizon_days"]
+    for target_metric in target_metrics:
+        df = build_labels(df, target_metric, horizon)
+        label_col = f"label_{target_metric}"
+        usable = df[label_col].notna().sum()
+        print(f"{target_metric}: {usable} / {len(df)} rows have a complete forward-looking label "
+              f"(rest are near the end of the available history, or -- for ratio metrics like "
+              f"cpa/cpc -- have an undefined/zero-denominator label over the forecast window)")
 
     processed_path = Path(config["paths"]["processed_dataset"])
     processed_path.parent.mkdir(parents=True, exist_ok=True)

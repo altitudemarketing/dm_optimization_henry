@@ -60,6 +60,10 @@ def build_rolling_features(daily: pd.DataFrame, rolling_windows) -> pd.DataFrame
             daily[f"conversions_rolling_{window}d"]
             / daily[f"clicks_rolling_{window}d"].replace(0, pd.NA)
         )
+        daily[f"cpc_rolling_{window}d"] = (
+            daily[f"spend_rolling_{window}d"]
+            / daily[f"clicks_rolling_{window}d"].replace(0, pd.NA)
+        )
 
     daily["day_of_week"] = daily["stat_date"].dt.dayofweek
     daily["is_weekend"] = daily["day_of_week"].isin([5, 6]).astype(int)
