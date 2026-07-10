@@ -49,8 +49,25 @@ import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 DEFAULT_ORDER = (1, 1, 1)
-DEFAULT_SEASONAL_ORDER = (1, 1, 1, 7)  # weekly seasonality
+# Seasonal order deliberately does NOT use seasonal differencing (D=0, not 1)
+# -- a double-differenced (regular d=1 AND seasonal D=1) SARIMAX extrapolates
+# an estimated trend/seasonal-drift component forward, and over the ~30+ day
+# forecast horizon this needs (test + val + horizon_days, extended from a
+# single fit point -- see run_sarimax), that trend can compound to wildly
+# diverging forecasts on short or noisy real series. D=0 with seasonal AR/MA
+# terms still captures weekly seasonality without that instability. Confirmed
+# against real Snowflake data: D=1 produced test RMSE=20.8 against MAE=3.17 --
+# a handful of entities blowing up to extreme values (RMSE >> MAE is the
+# signature of a few huge outliers, not uniformly-bad predictions).
+DEFAULT_SEASONAL_ORDER = (1, 0, 1, 7)  # weekly seasonality
 MIN_HISTORY_DAYS = 21                   # ~3 weekly cycles -- minimum to even attempt a seasonal fit
+# Hard safety net on top of the order change above -- even a well-behaved
+# order can occasionally diverge on a pathological series, and the cost of
+# checking is negligible. Caps each entity's predicted horizon-day sum at a
+# generous multiple of its own best training day -- generous enough to never
+# constrain a real forecast, tight enough to catch runaway extrapolation
+# before it reaches evaluate()/the hybrid's residual target.
+MAX_HISTORICAL_DAILY_MULTIPLE = 5
 
 
 def _complete_daily_index(series: pd.Series) -> pd.Series:
@@ -121,6 +138,7 @@ def run_sarimax(df, train_df, val_df, test_df, horizon_days,
     n_fit, n_fallback = 0, 0
     combined_by_entity = {}     # fitted (train) + forecast (post-train), concatenated for uniform lookup
     history_by_entity = {}      # for the naive fallback, keyed by entity
+    cap_by_entity = {}          # hard upper bound on this entity's predicted horizon-day sum
 
     for entity_id, g in df.groupby("entity_id"):
         s = g.set_index(pd.to_datetime(g["stat_date"]))["conversions"].sort_index()
@@ -144,12 +162,18 @@ def run_sarimax(df, train_df, val_df, test_df, horizon_days,
             forecast_series = pd.Series(np.asarray(forecast), index=forecast_index)
 
         combined_by_entity[entity_id] = pd.concat([fitted, forecast_series])
+        # max(..., 1) so an entity whose best day was small (or the rare
+        # all-nonzero-but-tiny series) still gets a sane, nonzero cap rather
+        # than one that clamps every forecast to ~0.
+        cap_by_entity[entity_id] = max(train_series.max(), 1) * horizon_days * MAX_HISTORICAL_DAILY_MULTIPLE
 
     elapsed = time.time() - start
     print(
         f"SARIMAX: fit {n_fit} entities, fell back to naive for {n_fallback} "
         f"(too little history, zero-variance series, or non-convergence) in {elapsed:.1f}s"
     )
+
+    capped_count = [0]  # mutable box -- closures can't assign to an outer int directly
 
     def _predict_row(entity_id, stat_date) -> float:
         window_start = stat_date + pd.Timedelta(days=1)
@@ -158,7 +182,12 @@ def run_sarimax(df, train_df, val_df, test_df, horizon_days,
         if combined is not None:
             window = combined[(combined.index >= window_start) & (combined.index <= window_end)]
             if len(window) == horizon_days:  # only trust a complete window
-                return float(np.clip(window.sum(), 0, None))
+                raw = float(window.sum())
+                cap = cap_by_entity.get(entity_id, float("inf"))
+                clipped = float(np.clip(raw, 0, cap))
+                if clipped != raw:
+                    capped_count[0] += 1
+                return clipped
         # Fall back: naive trailing average using only data available as of stat_date
         history = history_by_entity.get(entity_id)
         available = history[history.index <= stat_date] if history is not None else pd.Series(dtype=float)
@@ -168,12 +197,24 @@ def run_sarimax(df, train_df, val_df, test_df, horizon_days,
         dates = pd.to_datetime(split_df["stat_date"])
         return np.array([_predict_row(eid, d) for eid, d in zip(split_df["entity_id"], dates)])
 
+    train_pred = _predict_split(train_df)
+    val_pred = _predict_split(val_df)
+    test_pred = _predict_split(test_df)
+
+    if capped_count[0]:
+        print(
+            f"SARIMAX: clipped {capped_count[0]} runaway prediction(s) back down to a sane "
+            f"per-entity cap ({MAX_HISTORICAL_DAILY_MULTIPLE}x that entity's best training day x horizon) "
+            f"-- these would otherwise have been extreme extrapolation artifacts, not real forecasts."
+        )
+
     return {
-        "train_pred": _predict_split(train_df),
-        "val_pred": _predict_split(val_df),
-        "test_pred": _predict_split(test_df),
+        "train_pred": train_pred,
+        "val_pred": val_pred,
+        "test_pred": test_pred,
         "n_fit": n_fit,
         "n_fallback": n_fallback,
+        "n_capped": capped_count[0],
     }
 
 

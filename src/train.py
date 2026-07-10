@@ -451,7 +451,11 @@ def main(config_path=None):
                 "hurdle_segmented": hurdle_segmented,
                 "sarimax": sarimax_metrics,
                 "sarimax_segmented": sarimax_segmented,
-                "sarimax_fit_diagnostics": {"n_fit": sarimax_result["n_fit"], "n_fallback": sarimax_result["n_fallback"]},
+                "sarimax_fit_diagnostics": {
+                    "n_fit": sarimax_result["n_fit"],
+                    "n_fallback": sarimax_result["n_fallback"],
+                    "n_capped": sarimax_result["n_capped"],
+                },
                 "sarimax_gbm_hybrid": hybrid_metrics,
                 "sarimax_gbm_hybrid_segmented": hybrid_segmented,
                 "lower_test_mae": winner,
