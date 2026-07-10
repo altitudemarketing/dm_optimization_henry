@@ -1,0 +1,102 @@
+name: Fit response curve + generate spend recommendations
+
+# This is the workflow that keeps the ML Recommendations tab's new "Spend
+# Recommendations" section (src/optimize.py) fresh in production. Without
+# it, ML_SPEND_RECOMMENDATIONS only ever has whatever batch was last pushed
+# manually -- the frontend has no way to trigger this itself.
+#
+# Runs less often than train.yml: the response curve is fit on ~380 days of
+# campaign history (src/response_curve.py), which doesn't meaningfully shift
+# day to day the way the 7-day forecasting model's inputs do. Once daily,
+# offset an hour after the morning training run, is enough; adjust the cron
+# if your Snowflake refresh cadence differs.
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+concurrency:
+  group: optimize-spend-recommendations
+  cancel-in-progress: true
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Snowflake private key
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          echo "$SNOWFLAKE_PRIVATE_KEY" > snowflake_key.p8
+          chmod 600 snowflake_key.p8
+
+      - name: Build ad-group dataset (pull from Snowflake, build features)
+        # Runs in every workflow independently -- GitHub Actions runners
+        # don't share filesystem state across separate workflow files/runs,
+        # so this can't just reuse train.yml's output even though it builds
+        # the identical dataset.
+        env:
+          SNOWFLAKE_ACCOUNT_LOCATOR: ${{ secrets.SNOWFLAKE_ACCOUNT_LOCATOR }}
+          SNOWFLAKE_ACCOUNT_URL: ${{ secrets.SNOWFLAKE_ACCOUNT_URL }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_KEY_FILE: ./snowflake_key.p8
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        run: python -m scripts.build_dataset
+
+      - name: Fit campaign-level response curve
+        # Pulls ~380 days of campaign daily performance and fits the two-way
+        # fixed-effects elasticity model (see src/response_curve.py). Writes
+        # models/response_curve/{response_curve_metrics,campaign_fixed_effects,
+        # campaign_evidence}.json, which the next step reads.
+        env:
+          SNOWFLAKE_ACCOUNT_LOCATOR: ${{ secrets.SNOWFLAKE_ACCOUNT_LOCATOR }}
+          SNOWFLAKE_ACCOUNT_URL: ${{ secrets.SNOWFLAKE_ACCOUNT_URL }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_KEY_FILE: ./snowflake_key.p8
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        run: python -m scripts.train_response_curve
+
+      - name: Generate spend recommendations and upload to Snowflake
+        # Writes into FIVETRAN_DATABASE.GOOGLE_ADS.ML_SPEND_RECOMMENDATIONS
+        # via a narrow INSERT-only grant (see
+        # sql/grant_ml_spend_recommendations_write.sql) -- SLACK_BOT_RO stays
+        # read-only everywhere else. The Worker's
+        # /api/report/google-ads/ml-spend-recommendations route reads this
+        # table back for the frontend's Spend Recommendations section.
+        env:
+          SNOWFLAKE_ACCOUNT_LOCATOR: ${{ secrets.SNOWFLAKE_ACCOUNT_LOCATOR }}
+          SNOWFLAKE_ACCOUNT_URL: ${{ secrets.SNOWFLAKE_ACCOUNT_URL }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_KEY_FILE: ./snowflake_key.p8
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        run: python -m src.optimize
+
+      - name: Upload response curve + recommendation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimize-${{ github.run_id }}
+          path: |
+            models/response_curve/*.json
+            data/spend_recommendations.json
+          retention-days: 90
+
+      - name: Clean up key file
+        if: always()
+        run: rm -f snowflake_key.p8
