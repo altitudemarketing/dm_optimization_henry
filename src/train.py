@@ -19,6 +19,7 @@ from sklearn.metrics import mean_absolute_error, r2_score
 
 from src.config_loader import load_config
 from src.dataset import time_aware_split
+from src.sarimax_model import run_sarimax, train_sarimax_gbm_hybrid
 
 CATEGORICAL_FEATURES = ["client_id", "channel_type"]
 ID_AND_META_COLUMNS = {
@@ -377,6 +378,21 @@ def main(config_path=None):
     hurdle_metrics = evaluate(test_df[label_col].values, hurdle_preds, "hurdle")
     hurdle_segmented = evaluate_segmented(test_df[label_col].values, hurdle_preds, "hurdle")
 
+    # SARIMAX benchmark + SARIMAX/LightGBM hybrid -- see src/sarimax_model.py
+    # for the full design and its simplifications. These need each entity's
+    # raw historical conversions series (not just engineered features), so
+    # the pre-split `df` is passed in alongside the train/val/test splits.
+    sarimax_result = run_sarimax(df, train_df, val_df, test_df, horizon)
+    sarimax_metrics = evaluate(test_df[label_col].values, sarimax_result["test_pred"], "sarimax")
+    sarimax_segmented = evaluate_segmented(test_df[label_col].values, sarimax_result["test_pred"], "sarimax")
+
+    hybrid_result = train_sarimax_gbm_hybrid(
+        train_df, val_df, test_df, feature_cols, label_col, CATEGORICAL_FEATURES, sarimax_result, lgb_params,
+    )
+    hybrid_preds = hybrid_result["test_pred"]
+    hybrid_metrics = evaluate(test_df[label_col].values, hybrid_preds, "sarimax_gbm_hybrid")
+    hybrid_segmented = evaluate_segmented(test_df[label_col].values, hybrid_preds, "sarimax_gbm_hybrid")
+
     def _improvement(challenger_mae):
         if not baseline_metrics["mae"]:
             return float("nan")
@@ -385,8 +401,16 @@ def main(config_path=None):
     print(f"LightGBM MAE improvement over baseline: {_improvement(model_metrics['mae']):.1f}%")
     print(f"XGBoost MAE improvement over baseline: {_improvement(xgb_metrics['mae']):.1f}%")
     print(f"Hurdle MAE improvement over baseline: {_improvement(hurdle_metrics['mae']):.1f}%")
+    print(f"SARIMAX MAE improvement over baseline: {_improvement(sarimax_metrics['mae']):.1f}%")
+    print(f"SARIMAX+GBM hybrid MAE improvement over baseline: {_improvement(hybrid_metrics['mae']):.1f}%")
 
-    candidates = {"lightgbm": model_metrics["mae"], "xgboost": xgb_metrics["mae"], "hurdle": hurdle_metrics["mae"]}
+    candidates = {
+        "lightgbm": model_metrics["mae"],
+        "xgboost": xgb_metrics["mae"],
+        "hurdle": hurdle_metrics["mae"],
+        "sarimax": sarimax_metrics["mae"],
+        "sarimax_gbm_hybrid": hybrid_metrics["mae"],
+    }
     winner = min(candidates, key=candidates.get)
     print(f"Lower test MAE: {winner}")
 
@@ -404,6 +428,14 @@ def main(config_path=None):
     hurdle_reg_path = output_dir / f"{target_metric}_h{horizon}d_hurdle_regressor.txt"
     hurdle_result["regressor"].save_model(str(hurdle_reg_path))
 
+    # Note: the per-entity SARIMAX models themselves aren't saved -- there can
+    # be hundreds of them (one per active ad group), they're cheap to refit,
+    # and every other model in this pipeline is already retrained from scratch
+    # each run rather than persisted, so this stays consistent with that.
+    # Only the hybrid's residual GBM (a single model) is saved.
+    hybrid_path = output_dir / f"{target_metric}_h{horizon}d_sarimax_gbm_hybrid.txt"
+    hybrid_result["residual_model"].save_model(str(hybrid_path))
+
     metrics_path = output_dir / f"{target_metric}_h{horizon}d_metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(
@@ -417,6 +449,11 @@ def main(config_path=None):
                 "xgboost_segmented": xgb_segmented,
                 "hurdle": hurdle_metrics,
                 "hurdle_segmented": hurdle_segmented,
+                "sarimax": sarimax_metrics,
+                "sarimax_segmented": sarimax_segmented,
+                "sarimax_fit_diagnostics": {"n_fit": sarimax_result["n_fit"], "n_fallback": sarimax_result["n_fallback"]},
+                "sarimax_gbm_hybrid": hybrid_metrics,
+                "sarimax_gbm_hybrid_segmented": hybrid_segmented,
                 "lower_test_mae": winner,
             },
             f,
@@ -427,6 +464,7 @@ def main(config_path=None):
     print(f"Saved XGBoost model to {xgb_path}")
     print(f"Saved hurdle classifier to {hurdle_clf_path}")
     print(f"Saved hurdle regressor to {hurdle_reg_path}")
+    print(f"Saved SARIMAX+GBM hybrid residual model to {hybrid_path}")
     print(f"Saved metrics to {metrics_path}")
 
 
