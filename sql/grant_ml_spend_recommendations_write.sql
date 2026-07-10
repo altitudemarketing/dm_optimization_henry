@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS FIVETRAN_DATABASE.GOOGLE_ADS.ML_SPEND_RECOMMENDATIONS
     current_spend                         FLOAT,
     current_conversions                   FLOAT,
     current_cpa                           FLOAT,
+    cpa_target                             FLOAT,                    -- external CPA anchor the increase guardrail compares against (see src/optimize.py docstring for why NOT the ad group's own average)
+    cpa_target_source                      STRING,                   -- client_target_cpa | client_target_roas_implied | client_blended_avg_cpa | NULL (no resolvable target -- increases never evaluated)
     campaign_trailing_spend               FLOAT,                    -- parent campaign's current trailing spend (the grain the response curve was fit at)
     campaign_spend_range_min              FLOAT,                    -- parent campaign's historically observed min chunk spend (response_curve.py panel)
     campaign_spend_range_max              FLOAT,                    -- parent campaign's historically observed max chunk spend
@@ -42,6 +44,15 @@ CREATE TABLE IF NOT EXISTS FIVETRAN_DATABASE.GOOGLE_ADS.ML_SPEND_RECOMMENDATIONS
     requires_human_review                 BOOLEAN,
     model_used                            STRING
 );
+
+-- Safe to re-run against an already-existing table from before the
+-- increase-guardrail rework: adds the two new columns without touching
+-- anything else. Both are no-ops if the table was just created above with
+-- them already present.
+ALTER TABLE FIVETRAN_DATABASE.GOOGLE_ADS.ML_SPEND_RECOMMENDATIONS
+    ADD COLUMN IF NOT EXISTS cpa_target FLOAT;
+ALTER TABLE FIVETRAN_DATABASE.GOOGLE_ADS.ML_SPEND_RECOMMENDATIONS
+    ADD COLUMN IF NOT EXISTS cpa_target_source STRING;
 
 -- Narrow grant: append + read only, on this table only.
 GRANT INSERT, SELECT ON TABLE FIVETRAN_DATABASE.GOOGLE_ADS.ML_SPEND_RECOMMENDATIONS TO ROLE SLACK_BOT_RO;
