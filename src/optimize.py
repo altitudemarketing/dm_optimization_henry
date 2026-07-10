@@ -380,7 +380,7 @@ def build_spend_recommendations(config) -> pd.DataFrame:
     campaign_trailing_spend = latest.groupby("campaign_id")["current_spend"].transform("sum")
     latest["campaign_trailing_spend"] = campaign_trailing_spend
 
-    generated_at = pd.Timestamp.utcnow().tz_localize(None)
+    generated_at = pd.Timestamp.now("UTC").tz_localize(None)
     records = []
 
     for _, row in latest.iterrows():

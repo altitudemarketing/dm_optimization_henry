@@ -224,7 +224,7 @@ def build_recommendations(config) -> pd.DataFrame:
     # queries MAX(generated_at) against to serve "the latest run"'s
     # recommendations, and what makes every past run's snapshot a distinct,
     # queryable slice (useful for task #10's feedback loop later).
-    flagged["generated_at"] = pd.Timestamp.utcnow().tz_localize(None)
+    flagged["generated_at"] = pd.Timestamp.now("UTC").tz_localize(None)
 
     return flagged[empty_cols].sort_values(["severity", "client_rank_pct"]).reset_index(drop=True)
 
