@@ -32,7 +32,6 @@ Usage:
 """
 
 import argparse
-import os
 from pathlib import Path
 
 import numpy as np
@@ -41,19 +40,8 @@ import xgboost as xgb
 import lightgbm as lgb
 
 from src.config_loader import load_config
-from src.snowflake_client import SnowflakeConfigError, run_query
+from src.snowflake_client import SnowflakeConfigError, require_snowflake_env, run_query
 from src.train import CATEGORICAL_FEATURES, get_feature_columns
-
-_REQUIRED_SNOWFLAKE_ENV = [
-    "SNOWFLAKE_ACCOUNT_LOCATOR", "SNOWFLAKE_ACCOUNT_URL", "SNOWFLAKE_USER",
-    "SNOWFLAKE_KEY_FILE", "SNOWFLAKE_ROLE", "SNOWFLAKE_WAREHOUSE",
-]
-
-
-def _require_snowflake_env() -> None:
-    missing = [v for v in _REQUIRED_SNOWFLAKE_ENV if not os.environ.get(v)]
-    if missing:
-        raise SnowflakeConfigError(f"missing env vars: {', '.join(missing)}")
 
 # Column order matches sql/grant_ml_recommendations_write.sql's CREATE TABLE --
 # keep these in sync if either changes.
@@ -278,7 +266,7 @@ def upload_to_snowflake(recommendations: pd.DataFrame) -> None:
         return
 
     try:
-        _require_snowflake_env()
+        require_snowflake_env()
     except SnowflakeConfigError as e:
         # Expected when running locally / against synthetic data (see
         # README's "Testing without Snowflake access") -- don't block that

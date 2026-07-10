@@ -1,0 +1,54 @@
+name: Evaluate prediction accuracy
+
+# Scores past recommendations against what actually happened once each
+# forecast window has elapsed. Runs once daily -- there's no reason to run
+# this more often than the training job, since a 7-day-out forecast horizon
+# means most predictions aren't eligible for evaluation yet on any given day
+# anyway (see src/evaluate_accuracy.py's WHERE clause).
+on:
+  schedule:
+    - cron: "0 12 * * *"  # once daily, a few hours after the twice-daily training runs
+  workflow_dispatch: {}
+
+concurrency:
+  group: evaluate-prediction-accuracy
+  cancel-in-progress: true
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Snowflake private key
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          echo "$SNOWFLAKE_PRIVATE_KEY" > snowflake_key.p8
+          chmod 600 snowflake_key.p8
+
+      - name: Evaluate accuracy of past predictions
+        env:
+          SNOWFLAKE_ACCOUNT_LOCATOR: ${{ secrets.SNOWFLAKE_ACCOUNT_LOCATOR }}
+          SNOWFLAKE_ACCOUNT_URL: ${{ secrets.SNOWFLAKE_ACCOUNT_URL }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_KEY_FILE: ./snowflake_key.p8
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        run: python -m src.evaluate_accuracy
+
+      - name: Clean up key file
+        if: always()
+        run: rm -f snowflake_key.p8

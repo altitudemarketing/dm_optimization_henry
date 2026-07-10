@@ -97,11 +97,15 @@ src/
   dataset.py               time-aware train/val/test split
   train.py                 baseline + LightGBM + XGBoost + hurdle model training/evaluation
   recommend.py             scores latest data into guardrailed recommendation records
+  evaluate_accuracy.py     scores past recommendations against real outcomes once elapsed
 scripts/
   build_dataset.py         orchestrates the pull -> features -> labels -> parquet
   generate_synthetic_data.py   local test data, no Snowflake needed
   tune_hyperparameters.py  Optuna hyperparameter search (separate, weekly-scheduled job)
-sql/pull_ad_group_daily_performance.sql   reference copy of the Snowflake query
+sql/
+  pull_ad_group_daily_performance.sql          reference copy of the Snowflake training query
+  grant_ml_recommendations_write.sql           creates ML_RECOMMENDATIONS + narrow write grant
+  grant_ml_prediction_accuracy_write.sql       creates ML_PREDICTION_ACCURACY + narrow write grant
 ```
 
 ## Recommendation engine (`src/recommend.py`)
@@ -146,6 +150,33 @@ prescribing a specific bid/budget delta (e.g. "raise budget 23%") — that
 would need the causal/elasticity data this repo doesn't have yet (see
 "Why this doesn't include bid/budget change history" below). v1 tells you
 *what to look at and which direction*, not *the exact dial to turn*.
+
+## Prediction accuracy monitoring (`src/evaluate_accuracy.py`)
+
+Scores past recommendations against what actually happened, once each
+forecast window has genuinely elapsed, and appends the result to
+`FIVETRAN_DATABASE.GOOGLE_ADS.ML_PREDICTION_ACCURACY` (see
+`sql/grant_ml_prediction_accuracy_write.sql` for the table + the same narrow
+`INSERT`+`SELECT`-only grant pattern used for `ML_RECOMMENDATIONS`). Runs
+entirely as a single `INSERT ... SELECT` executed in Snowflake — a range join
+between `ML_RECOMMENDATIONS` and `HOURLY_STATS_MAT` on `(stat_date,
+stat_date + horizon_days]` per entity, so there's no need to pull rows into
+pandas for this. A `NOT EXISTS` check guarantees each (entity, prediction
+batch) pair is scored exactly once; nothing here ever `UPDATE`s or `DELETE`s
+a row.
+
+Scheduled daily (`.github/workflows/evaluate_accuracy.yml`) — no need to run
+it more often, since a 7-day horizon means most predictions on any given day
+aren't eligible for evaluation yet anyway. The frontend's "Prediction
+Accuracy" tab reads this table back via `/api/report/google-ads/ml-accuracy`,
+showing MAE over time vs. the naive baseline (is the model's real-world track
+record holding up, not just its backtest) and directional accuracy by
+recommendation type (when we flagged a decline, did it actually decline).
+
+This is also the foundation for the feedback/outcome logging loop on the
+roadmap below — once a table of "predicted X, actual Y" exists across enough
+history, it becomes the natural training data for the causal/autonomous
+phase.
 
 ## Why this doesn't include bid/budget change history
 

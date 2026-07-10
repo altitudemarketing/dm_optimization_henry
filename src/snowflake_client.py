@@ -48,6 +48,25 @@ def _require_env(name: str) -> str:
     return value
 
 
+_REQUIRED_ENV_VARS = [
+    "SNOWFLAKE_ACCOUNT_LOCATOR", "SNOWFLAKE_ACCOUNT_URL", "SNOWFLAKE_USER",
+    "SNOWFLAKE_KEY_FILE", "SNOWFLAKE_ROLE", "SNOWFLAKE_WAREHOUSE",
+]
+
+
+def require_snowflake_env() -> None:
+    """
+    Raises SnowflakeConfigError listing every missing var, rather than
+    failing on the first one via run_query() -- used by callers (e.g.
+    src/recommend.py, src/evaluate_accuracy.py) that want to skip a
+    Snowflake-only step gracefully (e.g. when running locally against
+    synthetic data) instead of crashing.
+    """
+    missing = [v for v in _REQUIRED_ENV_VARS if not os.environ.get(v)]
+    if missing:
+        raise SnowflakeConfigError(f"missing env vars: {', '.join(missing)}")
+
+
 def _build_jwt(account_locator: str, user: str, key_file: str) -> str:
     with open(key_file, "rb") as f:
         private_key = load_pem_private_key(f.read(), password=None)
