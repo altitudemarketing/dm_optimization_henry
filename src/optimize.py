@@ -151,6 +151,15 @@ OUTPUT_COLUMNS = SNOWFLAKE_COLUMNS  # same shape locally and in Snowflake
 MODEL_NAME = "response_curve_v1"
 
 # ── External CPA target resolution (see module docstring) ──────────────────────
+# CLIENT_BLENDED_CPA is computed EXCLUDING the campaign it's being attached to
+# (client total minus this campaign's own spend/conversions) -- real-data audit
+# during this project caught the un-excluded version being circular in
+# practice: one client had exactly one campaign in the trailing window, so its
+# "external" blended CPA was just that campaign's own noisy 1-conversion
+# average relabeled; another client's target campaign alone supplied over half
+# the spend/conversions feeding its own "external" comparison. Excluding self
+# fixes both -- and correctly yields NULL (no resolvable target) for a
+# single-campaign client, rather than a fake external number.
 CPA_TARGET_QUERY_TEMPLATE = """
 WITH campaign_trailing AS (
     SELECT CLIENT_ID, CAMPAIGN_ID,
@@ -160,8 +169,10 @@ WITH campaign_trailing AS (
     WHERE STAT_DATE >= DATEADD(day, -{history_days}, CURRENT_DATE())
     GROUP BY CLIENT_ID, CAMPAIGN_ID
 ),
-client_blended AS (
-    SELECT CLIENT_ID, SUM(SPEND) / NULLIF(SUM(CONVERSIONS), 0) AS CLIENT_BLENDED_CPA
+client_totals AS (
+    SELECT CLIENT_ID,
+           SUM(SPEND) AS CLIENT_TOTAL_SPEND,
+           SUM(CONVERSIONS) AS CLIENT_TOTAL_CONVERSIONS
     FROM campaign_trailing
     GROUP BY CLIENT_ID
 ),
@@ -173,10 +184,11 @@ bidding AS (
 SELECT
     ct.CAMPAIGN_ID, ct.CLIENT_ID, ct.CONVERSIONS, ct.CONVERSIONS_VALUE,
     b.TARGET_CPA, b.TARGET_ROAS, b.BIDDING_STRATEGY_TYPE,
-    cb.CLIENT_BLENDED_CPA
+    (ctot.CLIENT_TOTAL_SPEND - ct.SPEND)
+        / NULLIF(ctot.CLIENT_TOTAL_CONVERSIONS - ct.CONVERSIONS, 0) AS CLIENT_BLENDED_CPA
 FROM campaign_trailing ct
+JOIN client_totals ctot ON ctot.CLIENT_ID = ct.CLIENT_ID
 LEFT JOIN bidding b ON b.CAMPAIGN_ID = ct.CAMPAIGN_ID
-LEFT JOIN client_blended cb ON cb.CLIENT_ID = ct.CLIENT_ID
 """
 
 CPA_TARGET_SOURCE_LABELS = {
